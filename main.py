@@ -1,5 +1,5 @@
 """
-OSINT Infosys v0.13 — Email Intelligence
+OSINT Infosys v0.13.2 — Email Intelligence
 Holehe platform registrations + similar-email candidate discovery.
 """
 import os
@@ -26,7 +26,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is required")
 
-app = FastAPI(title="OSINT Infosys", version="0.13.1")
+app = FastAPI(title="OSINT Infosys", version="0.13.2")
 
 
 # ---------------------------------------------------------------- storage
@@ -54,7 +54,7 @@ def init_db():
 
 @app.on_event("startup")
 async def startup_event():
-    log.info("OSINT Infosys v0.13.1 starting")
+    log.info("OSINT Infosys v0.13.2 starting")
     init_db()
     log.info("Database: initialized")
     for cmd in [["holehe", "--version"], [sys.executable, "-m", "holehe", "--version"]]:
@@ -69,6 +69,11 @@ async def startup_event():
             continue
     else:
         log.warning("Holehe binary: NOT FOUND — scans will return errors")
+
+
+@app.head("/")
+async def root_head():
+    return {}
 
 
 # ---------------------------------------------------------------- holehe
@@ -91,26 +96,36 @@ async def run_holehe(email: str) -> dict:
             except asyncio.TimeoutError:
                 proc.kill()
                 return {"status": "timeout", "found": [], "not_found": [],
-                        "error": "Holehe timed out after 150s"}
+                        "rate_limited": [], "error": "Holehe timed out after 150s"}
 
             output = stdout.decode("utf-8", errors="ignore")
-            found, not_found = [], []
+            found, not_found, rate_limited = [], [], []
             for line in output.splitlines():
                 line = line.strip()
+                if not line:
+                    continue
+                # Skip the summary legend that Holehe prints at the bottom
+                if "Email used" in line or "Email not used" in line or "Rate limit" in line:
+                    continue
                 if line.startswith("[+]"):
                     site = line[3:].strip()
-                    if site:
+                    if site and site not in found:
                         found.append(site)
                 elif line.startswith("[-]"):
                     site = line[3:].strip()
-                    if site:
+                    if site and site not in not_found:
                         not_found.append(site)
+                elif line.startswith("[x]"):
+                    site = line[3:].strip()
+                    if site and site not in rate_limited:
+                        rate_limited.append(site)
 
             return {
                 "status": "success",
                 "found": found,
                 "not_found": not_found,
-                "total": len(found) + len(not_found),
+                "rate_limited": rate_limited,
+                "total": len(found) + len(not_found) + len(rate_limited),
             }
         except FileNotFoundError:
             last_error = f"command not found: {' '.join(cmd[:2])}"
@@ -120,7 +135,7 @@ async def run_holehe(email: str) -> dict:
             continue
 
     return {"status": "error", "error": last_error or "unknown",
-            "found": [], "not_found": [], "total": 0}
+            "found": [], "not_found": [], "rate_limited": [], "total": 0}
 
 
 # ---------------------------------------------------------------- similar emails
@@ -177,13 +192,13 @@ async def discover_similar(email: str) -> list[dict]:
     for v in variants:
         g = await fetch_gravatar(v)
         if g["exists"] and target["exists"] and g["image_sha"] == target["image_sha"]:
-            signal, reason = "HIGH", "Gravatar avatar matches target's avatar exactly."
+            signal, reason = "HIGH", "Gravatar avatar matches target's avatar exactly. Weak ownership signal — not proof."
         elif g["exists"] and target["exists"]:
-            signal, reason = "MEDIUM", "Gravatar avatar exists, but the image differs from target's."
+            signal, reason = "MEDIUM", "Gravatar avatar exists, but the image differs from target's. Weak signal."
         elif g["exists"]:
             signal, reason = "MEDIUM", "Gravatar avatar exists (target has none to compare)."
         else:
-            signal, reason = "NONE", "Pattern match only — no public Gravatar signal found."
+            signal, reason = "NONE", "No Gravatar exists. This variant was generated from rules only — zero evidence."
         candidates.append({
             "email": v, "signal": signal, "reason": reason,
             "gravatar_url": g.get("url"),
@@ -216,7 +231,8 @@ async def run_job(job_id: str, email: str):
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
         update("done", result=result)
-        log.info(f"Job {job_id}: done ({len(holehe_result.get('found', []))} found, {len(similar)} similar)")
+        log.info(f"Job {job_id}: done ({len(holehe_result.get('found', []))} found, "
+                 f"{len(holehe_result.get('rate_limited', []))} rate-limited)")
     except Exception as e:
         log.exception(f"Job {job_id}: failed")
         update("failed", error=str(e))
@@ -255,7 +271,7 @@ async def get_job(job_id: str):
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "version": "0.13.1"}
+    return {"status": "ok", "version": "0.13.2"}
 
 
 # ---------------------------------------------------------------- frontend
@@ -306,6 +322,12 @@ button:disabled{opacity:.5;cursor:not-allowed}
 .candidate .reason{font-size:11px;color:#9ca3af;margin-top:6px;line-height:1.5}
 .link{font-size:11px;color:#10b981;margin-top:8px;display:inline-block}
 .footer{text-align:center;font-size:11px;color:#4b5563;padding:30px 0 20px;line-height:1.8}
+details.rl{border:1px solid #78350f;background:#1c1917;border-radius:8px;padding:12px;margin-top:12px}
+details.rl summary{cursor:pointer;font-size:12px;color:#fbbf24;font-weight:600}
+details.rl .rl-note{font-size:11px;color:#9ca3af;margin:8px 0;line-height:1.5}
+details.rl .rl-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+details.rl .rl-tags span{background:#292524;color:#fbbf24;padding:3px 8px;border-radius:4px;
+                         font-size:10px;font-family:monospace;word-break:break-all}
 </style>
 </head>
 <body>
@@ -341,7 +363,7 @@ async function runCheck() {
   document.getElementById('run').textContent = 'Investigating...';
   document.getElementById('results').innerHTML = '';
   document.getElementById('status').innerHTML =
-    '<div class="status running">Scanning 120+ platforms via Holehe and checking Gravatar candidates. 60-120s on first run.</div>';
+    '<div class="status running">Scanning platforms via Holehe. First run after idle can take 60-120s.</div>';
   try {
     const res = await fetch('/api/check', {
       method: 'POST',
@@ -384,39 +406,57 @@ function renderResults(r) {
   const h = r.holehe || {};
   const found = h.found || [];
   const notFound = h.not_found || [];
+  const rateLimited = h.rate_limited || [];
   const similar = r.similar_emails || [];
+  const totalChecked = found.length + notFound.length + rateLimited.length;
   let html = '';
 
+  // Platform registrations
   html += '<div class="card">';
   html += '<h2>Platform Registrations <span class="count">' + found.length + ' found</span></h2>';
   if (h.status === 'timeout' || h.status === 'error') {
     html += '<p style="color:#fca5a5;font-size:13px">Holehe scan ' +
             (h.status === 'timeout' ? 'timed out' : 'failed: ' + escapeHtml(h.error || '')) + '</p>';
   } else if (found.length === 0) {
-    html += '<p style="color:#9ca3af;font-size:13px">No platform registrations detected. Not a negative finding — the email may still be registered elsewhere.</p>';
+    html += '<p style="color:#9ca3af;font-size:13px">No platform registrations detected. This is not a negative finding — the email may still be registered on platforms Holehe could not reach.</p>';
   } else {
     html += '<div class="grid">';
     found.forEach(p => { html += '<div class="platform">' + escapeHtml(p) + '</div>'; });
     html += '</div>';
   }
-  if (notFound.length > 0) {
-    html += '<p style="color:#6b7280;font-size:11px;margin-top:12px">Checked ' +
-            (found.length + notFound.length) + ' platforms · not registered on ' + notFound.length + '</p>';
+  if (totalChecked > 0) {
+    html += '<p style="color:#6b7280;font-size:11px;margin-top:12px">Checked ' + totalChecked +
+            ' platforms · ' + found.length + ' found · ' + notFound.length + ' not found · ' +
+            rateLimited.length + ' rate-limited</p>';
+  }
+  if (rateLimited.length > 0 && totalChecked > 0) {
+    const pct = Math.round(100 * rateLimited.length / totalChecked);
+    html += '<details class="rl">';
+    html += '<summary>⚠️ ' + rateLimited.length + ' platforms rate-limited (' + pct +
+            '% of checked) — click to see which</summary>';
+    html += '<p class="rl-note">Render\'s shared IP was blocked by these platforms. This is a coverage limit, not a negative result. To check these properly you need a dedicated IP (Oracle VM) or a paid Render plan.</p>';
+    html += '<div class="rl-tags">';
+    rateLimited.forEach(p => { html += '<span>' + escapeHtml(p) + '</span>'; });
+    html += '</div></details>';
   }
   html += '</div>';
 
+  // Similar emails
   if (similar.length > 0) {
-    const highCount = similar.filter(s => s.signal === 'HIGH').length;
-    const medCount = similar.filter(s => s.signal === 'MEDIUM').length;
-    const noneCount = similar.filter(s => s.signal === 'NONE').length;
+    const high = similar.filter(s => s.signal === 'HIGH').length;
+    const med = similar.filter(s => s.signal === 'MEDIUM').length;
+    const none = similar.filter(s => s.signal === 'NONE').length;
     html += '<div class="card">';
     html += '<h2>Similar Email Candidates <span class="count">' + similar.length + ' total</span></h2>';
-    html += '<p style="color:#f59e0b;font-size:11px;margin-bottom:14px">⚠️ Every candidate requires manual verification. Pattern match alone does not establish ownership.</p>';
+    html += '<p style="color:#f59e0b;font-size:11px;margin-bottom:14px">⚠️ These are <b>generated variants</b> — the tool invents them from name-pattern rules, then checks Gravatar as the only signal. They are <b>not discovered accounts</b>. Verify each manually or ignore if you do not recognise them.</p>';
     similar.forEach(s => {
       const cls = s.signal === 'HIGH' ? 'high' : s.signal === 'MEDIUM' ? 'medium' : 'none';
+      const label = s.signal === 'HIGH' ? 'HIGH SIGNAL'
+                   : s.signal === 'MEDIUM' ? 'WEAK SIGNAL'
+                   : 'NO EVIDENCE';
       html += '<div class="candidate ' + cls + '">';
       html += '<div class="email">' + escapeHtml(s.email) + '</div>';
-      html += '<span class="signal ' + s.signal + '">' + s.signal + '</span>';
+      html += '<span class="signal ' + s.signal + '">' + label + '</span>';
       html += '<div class="reason">' + escapeHtml(s.reason) + '</div>';
       if (s.gravatar_url) {
         html += '<a class="link" href="' + escapeHtml(s.gravatar_url) +
@@ -425,7 +465,7 @@ function renderResults(r) {
       html += '</div>';
     });
     html += '<p style="color:#6b7280;font-size:11px;margin-top:12px">' +
-            highCount + ' high signal · ' + medCount + ' medium · ' + noneCount + ' pattern-only</p>';
+            high + ' high signal · ' + med + ' weak · ' + none + ' no evidence</p>';
     html += '</div>';
   }
   document.getElementById('results').innerHTML = html;
