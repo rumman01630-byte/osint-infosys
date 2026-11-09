@@ -1,76 +1,132 @@
 """
-OSINT Infosys v0.14 — Email Intelligence
-DNS + Holehe + DuckDuckGo/Bing public references.
+OSINT Infosys v0.15.1 — hardened email intelligence
+- Bearer token auth (saved once in browser localStorage)
+- Fernet encryption at rest (key derived from OSINT_API_TOKEN)
+- No plaintext email stored in results
+- Heartbeat-based job recovery
+- Holehe + DNS + DuckDuckGo + Bing
 """
-import os
-import sys
-import json
-import asyncio
-import hashlib
-import uuid
-import logging
-import re
-from datetime import datetime, timezone
-from typing import Optional
-from urllib.parse import quote
+from __future__ import annotations
 
+import asyncio
+import base64
+import hashlib
+import html
+import json
+import logging
+import os
+import re
+import secrets
+import sys
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
+
+import dns.asyncresolver
+import dns.resolver
 import httpx
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from cryptography.fernet import Fernet, InvalidToken
+from email_validator import EmailNotValidError, validate_email
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-log = logging.getLogger("osint")
+VERSION = "0.15.1"
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+API_TOKEN = os.environ.get("OSINT_API_TOKEN", "").strip()
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL environment variable is required")
+    raise RuntimeError("DATABASE_URL is required")
+if len(API_TOKEN) < 32:
+    raise RuntimeError(
+        "OSINT_API_TOKEN must be at least 32 characters. "
+        "Generate one locally with: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+    )
 
-app = FastAPI(title="OSINT Infosys", version="0.14.0")
+# Derive Fernet key from API token (single secret to manage)
+_SALT = b"osint-infosys-v0151-key-derivation"
+_DK = hashlib.pbkdf2_hmac("sha256", API_TOKEN.encode(), _SALT, 100_000, dklen=32)
+cipher = Fernet(base64.urlsafe_b64encode(_DK))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("osint")
+app = FastAPI(title="OSINT Infosys", version=VERSION)
+job_semaphore = asyncio.Semaphore(2)
 
 
-# ---------------------------------------------------------------- storage
-def db():
-    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-    conn.autocommit = True
-    return conn
+@contextmanager
+def db_connection():
+    conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
-def init_db():
-    with db() as conn:
+def init_db() -> None:
+    with db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS jobs (
-                    job_id      TEXT PRIMARY KEY,
-                    status      TEXT NOT NULL,
-                    email       TEXT NOT NULL,
-                    result      JSONB,
-                    error       TEXT,
-                    created_at  TIMESTAMPTZ DEFAULT NOW(),
-                    updated_at  TIMESTAMPTZ DEFAULT NOW()
+                CREATE TABLE IF NOT EXISTS jobs_v0151 (
+                    job_id UUID PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    email_ciphertext TEXT NOT NULL,
+                    email_sha256 TEXT NOT NULL,
+                    result_ciphertext TEXT,
+                    error TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    started_at TIMESTAMPTZ,
+                    last_heartbeat_at TIMESTAMPTZ,
+                    completed_at TIMESTAMPTZ
                 )
             """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_jobs_v0151_status
+                ON jobs_v0151(status, created_at DESC)
+            """)
+            # Only mark jobs stale if heartbeat is truly old (>10 min) — do NOT kill live jobs
+            cur.execute("""
+                UPDATE jobs_v0151
+                SET status='interrupted',
+                    error='Job execution was interrupted (no heartbeat for 10+ minutes).',
+                    completed_at=NOW(),
+                    updated_at=NOW()
+                WHERE status='running'
+                  AND (last_heartbeat_at IS NULL OR last_heartbeat_at < NOW() - INTERVAL '10 minutes')
+            """)
+            # Pending jobs that never started for >15 min
+            cur.execute("""
+                UPDATE jobs_v0151
+                SET status='interrupted',
+                    error='Job was queued but never started (interrupted by restart before execution).',
+                    completed_at=NOW(),
+                    updated_at=NOW()
+                WHERE status='pending'
+                  AND created_at < NOW() - INTERVAL '15 minutes'
+            """)
+
+
+def require_auth(authorization: str | None = Header(default=None)) -> None:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Bearer token required")
+    supplied = authorization[7:].strip()
+    if not secrets.compare_digest(supplied, API_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid bearer token")
 
 
 @app.on_event("startup")
 async def startup_event():
-    log.info("OSINT Infosys v0.14.0 starting")
     init_db()
-    log.info("Database: initialized")
-    for cmd in [["holehe", "--version"], [sys.executable, "-m", "holehe", "--version"]]:
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-            await asyncio.wait_for(proc.wait(), timeout=5)
-            log.info(f"Holehe binary: reachable via '{' '.join(cmd[:2])}'")
-            break
-        except (FileNotFoundError, asyncio.TimeoutError):
-            continue
-    else:
-        log.warning("Holehe binary: NOT FOUND — scans will return errors")
+    log.info("OSINT Infosys %s initialized", VERSION)
 
 
 @app.head("/")
@@ -78,434 +134,575 @@ async def root_head():
     return {}
 
 
-# ---------------------------------------------------------------- holehe
-async def run_holehe(email: str) -> dict:
-    """Run holehe WITHOUT --only-used so we see found + not-found + rate-limited."""
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok", "version": VERSION}
+
+
+def normalize_email(value: str) -> tuple[str, str]:
+    try:
+        checked = validate_email(value.strip(), check_deliverability=False)
+        normalized = checked.normalized
+        local, domain = normalized.rsplit("@", 1)
+        return f"{local}@{domain.lower()}", domain.lower()
+    except EmailNotValidError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+def source_record(source: str, status: str, method: str, **kwargs) -> dict[str, Any]:
+    return {
+        "source": source,
+        "status": status,
+        "method": method,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        **kwargs,
+    }
+
+
+# ---------- DNS ----------
+async def dns_lookup(domain: str) -> dict[str, Any]:
+    resolver = dns.asyncresolver.Resolver()
+    resolver.lifetime = 5.0
+    records: dict[str, Any] = {}
+    checks = [("MX", "MX"), ("SPF", "TXT"), ("DMARC", "TXT")]
+    for label, qtype in checks:
+        qname = f"_dmarc.{domain}" if label == "DMARC" else domain
+        try:
+            answer = await resolver.resolve(qname, qtype, raise_on_no_answer=False)
+            values = []
+            if answer.rrset:
+                for item in answer:
+                    if qtype == "MX":
+                        values.append(str(item.exchange).rstrip("."))
+                    else:
+                        values.append("".join(part.decode("utf-8", "replace") for part in item.strings))
+            if label == "SPF":
+                values = [v for v in values if v.lower().startswith("v=spf1")]
+            if label == "DMARC":
+                values = [v for v in values if v.lower().startswith("v=dmarc1")]
+            records[label] = source_record(
+                "DNS", "found" if values else "not_found",
+                f"DNS {qtype} lookup", query=qname, values=values,
+                limitation="DNS presence does not verify mailbox existence or ownership."
+            )
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+            records[label] = source_record("DNS", "not_found", f"DNS {qtype} lookup", query=qname, values=[])
+        except Exception as exc:
+            records[label] = source_record("DNS", "error", f"DNS {qtype} lookup",
+                                           query=qname, error=type(exc).__name__, values=[])
+    return records
+
+
+# ---------- Public search ----------
+def clean_text(value: str) -> str:
+    value = re.sub(r"<[^>]*>", " ", value)
+    return re.sub(r"\s+", " ", html.unescape(value)).strip()
+
+
+def safe_http_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    except Exception:
+        return False
+
+
+def unwrap_ddg_url(href: str) -> str:
+    try:
+        parsed = urlparse(href)
+        if "duckduckgo.com" in (parsed.hostname or ""):
+            target = parse_qs(parsed.query).get("uddg", [])
+            if target:
+                return unquote(target[0])
+        return href
+    except Exception:
+        return href
+
+
+async def public_search(provider: str, email: str, limit: int = 12) -> dict[str, Any]:
+    headers = {"User-Agent": "OSINT-Infosys/0.15.1 (+authorized public-source research)"}
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True,
+                                     max_redirects=5, headers=headers) as client:
+            if provider == "DuckDuckGo":
+                response = await client.post("https://html.duckduckgo.com/html/",
+                                             data={"q": f'"{email}"'})
+            else:
+                response = await client.get("https://www.bing.com/search",
+                                            params={"q": f'"{email}"'})
+        if response.status_code == 429:
+            return source_record(provider, "rate_limited", "exact-email public search",
+                                 results=[], http_status=429)
+        if response.status_code in (401, 403, 407):
+            return source_record(provider, "blocked", "exact-email public search",
+                                 results=[], http_status=response.status_code)
+        if response.status_code != 200:
+            return source_record(provider, "unavailable", "exact-email public search",
+                                 results=[], http_status=response.status_code)
+
+        page = response.text
+        low = page.lower()
+        if any(marker in low for marker in ("captcha", "unusual traffic", "verify you are human",
+                                             "consent required", "robot check")):
+            return source_record(provider, "blocked", "HTML challenge detection",
+                                 results=[], limitation="Provider returned a challenge page.")
+
+        results = []
+        if provider == "DuckDuckGo":
+            blocks = re.findall(
+                r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+                page, re.I | re.S
+            )
+            for href, title in blocks[:limit]:
+                url = unwrap_ddg_url(html.unescape(href))
+                if safe_http_url(url):
+                    results.append({"title": clean_text(title)[:200], "url": url[:1000], "snippet": ""})
+        else:
+            blocks = re.findall(
+                r'<li[^>]+class="[^"]*b_algo[^"]*"[^>]*>.*?<h2[^>]*>.*?<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>.*?</h2>(.*?)(?=<li[^>]+class="[^"]*b_algo|$)',
+                page, re.I | re.S
+            )
+            for href, title, body in blocks[:limit]:
+                url = html.unescape(href)
+                if safe_http_url(url):
+                    snippet_match = re.search(r"<p[^>]*>(.*?)</p>", body, re.I | re.S)
+                    snippet = clean_text(snippet_match.group(1))[:400] if snippet_match else ""
+                    results.append({"title": clean_text(title)[:200], "url": url[:1000], "snippet": snippet})
+
+        if results:
+            status = "found"
+        else:
+            no_result_markers = ("no results found", "there are no results for", "no results for")
+            status = "not_found" if any(m in low for m in no_result_markers) else "unavailable"
+
+        return source_record(provider, status, "exact-email public search",
+                             results=results,
+                             limitation="HTML parsing is best-effort; empty pages may not mean no results.")
+
+    except httpx.TimeoutException:
+        return source_record(provider, "unavailable", "exact-email public search",
+                             results=[], error="timeout")
+    except Exception as exc:
+        return source_record(provider, "error", "exact-email public search",
+                             results=[], error=type(exc).__name__)
+
+
+# ---------- Holehe ----------
+async def run_holehe(email: str) -> dict[str, Any]:
     commands = [
         ["holehe", email, "--no-color"],
-        ["python", "-m", "holehe", email, "--no-color"],
         [sys.executable, "-m", "holehe", email, "--no-color"],
     ]
-    last_error = None
+    last_error = "Holehe not found"
     for cmd in commands:
         try:
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
             try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=150)
             except asyncio.TimeoutError:
                 proc.kill()
-                return {"status": "timeout", "found": [], "not_found": [],
-                        "rate_limited": [], "error": "Holehe timed out after 180s"}
-
-            output = stdout.decode("utf-8", errors="ignore")
-            found, not_found, rate_limited = [], [], []
-            for line in output.splitlines():
-                line = line.strip()
+                await proc.wait()
+                return source_record("Holehe", "error", "CLI execution",
+                                     found=[], not_found=[], rate_limited=[],
+                                     error="timeout")
+            output = stdout.decode("utf-8", "replace")
+            found, not_found, rate_limited, blocked = [], [], [], []
+            recognized = 0
+            for raw in output.splitlines():
+                line = raw.strip()
                 if not line:
                     continue
                 if "Email used" in line or "Email not used" in line or "Rate limit" in line:
                     continue
                 if line.startswith("[+]"):
-                    site = line[3:].strip()
-                    if site and site not in found:
-                        found.append(site)
+                    s = line[3:].strip()
+                    if s: found.append(s); recognized += 1
                 elif line.startswith("[-]"):
-                    site = line[3:].strip()
-                    if site and site not in not_found:
-                        not_found.append(site)
+                    s = line[3:].strip()
+                    if s: not_found.append(s); recognized += 1
                 elif line.startswith("[x]"):
-                    site = line[3:].strip()
-                    if site and site not in rate_limited:
-                        rate_limited.append(site)
+                    s = line[3:].strip()
+                    if s: rate_limited.append(s); recognized += 1
+                elif "blocked" in line.lower():
+                    blocked.append(line[:180])
 
-            return {
-                "status": "success",
-                "found": found,
-                "not_found": not_found,
-                "rate_limited": rate_limited,
-                "total": len(found) + len(not_found) + len(rate_limited),
-            }
+            if recognized == 0:
+                return source_record("Holehe", "error", "CLI output parsing",
+                                     found=[], not_found=[], rate_limited=[], blocked=blocked,
+                                     parser_status="unrecognized",
+                                     error="No recognized [±x] lines in Holehe output")
+
+            overall = "found" if found else ("rate_limited" if rate_limited else ("blocked" if blocked else ("not_found" if not_found else "unavailable")))
+            return source_record("Holehe", overall, "CLI output parsing",
+                                 found=list(dict.fromkeys(found)),
+                                 not_found=list(dict.fromkeys(not_found)),
+                                 rate_limited=list(dict.fromkeys(rate_limited)),
+                                 blocked=blocked, parser_status="recognized",
+                                 parsed_count=recognized,
+                                 limitation="Holehe results are association signals only, not ownership proof.")
         except FileNotFoundError:
-            last_error = f"command not found: {' '.join(cmd[:2])}"
             continue
-        except Exception as e:
-            last_error = str(e)
+        except Exception as exc:
+            last_error = type(exc).__name__
+
+    return source_record("Holehe", "unavailable", "CLI execution",
+                         found=[], not_found=[], rate_limited=[], error=last_error)
+
+
+# ---------- Job execution ----------
+async def heartbeat_loop(job_id: str, stop_event: asyncio.Event):
+    while not stop_event.is_set():
+        try:
+            with db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE jobs_v0151 SET last_heartbeat_at=NOW(), updated_at=NOW() "
+                        "WHERE job_id=%s AND status='running'",
+                        (job_id,)
+                    )
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=20)
+        except asyncio.TimeoutError:
             continue
 
-    return {"status": "error", "error": last_error or "unknown",
-            "found": [], "not_found": [], "rate_limited": [], "total": 0}
+
+async def execute_investigation(job_id: str, email: str, domain: str):
+    async with job_semaphore:
+        stop_event = asyncio.Event()
+        heartbeat_task = asyncio.create_task(heartbeat_loop(job_id, stop_event))
+        try:
+            with db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE jobs_v0151 SET status='running', started_at=NOW(), "
+                        "last_heartbeat_at=NOW(), updated_at=NOW() WHERE job_id=%s",
+                        (job_id,)
+                    )
+
+            holehe, dns_r, ddg, bing = await asyncio.gather(
+                run_holehe(email), dns_lookup(domain),
+                public_search("DuckDuckGo", email), public_search("Bing", email)
+            )
+
+            refs = []
+            seen = set()
+            for pr in (ddg, bing):
+                for item in pr.get("results", []):
+                    if item["url"] in seen:
+                        continue
+                    seen.add(item["url"])
+                    refs.append({**item, "discovery_source": pr["source"]})
+
+            # NOTE: no "email" field in result — prevents plaintext leak
+            result_payload = {
+                "schema_version": "0.15.1",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "sources": {
+                    "holehe": holehe,
+                    "dns": dns_r,
+                    "duckduckgo": ddg,
+                    "bing": bing,
+                },
+                "public_references": refs,
+                "assessment": {
+                    "conclusion": "unresolved",
+                    "note": "Observations are leads only. No result establishes account ownership or common identity.",
+                },
+            }
+
+            encrypted_result = cipher.encrypt(json.dumps(result_payload).encode()).decode()
+
+            with db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE jobs_v0151 SET status='done', result_ciphertext=%s,
+                        error=NULL, completed_at=NOW(), updated_at=NOW()
+                        WHERE job_id=%s
+                    """, (encrypted_result, job_id))
+        except Exception as exc:
+            log.exception("Job failed (id=%s)", job_id)
+            try:
+                with db_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE jobs_v0151 SET status='failed', error=%s, "
+                            "completed_at=NOW(), updated_at=NOW() WHERE job_id=%s",
+                            (type(exc).__name__, job_id)
+                        )
+            except Exception:
+                pass
+        finally:
+            stop_event.set()
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
-# ---------------------------------------------------------------- public web search
-async def search_duckduckgo(email: str, limit: int = 15) -> dict:
-    """Search DuckDuckGo HTML for the exact email."""
-    url = "https://html.duckduckgo.com/html/"
-    params = {"q": f'"{email}"'}
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; OSINT-Infosys/0.14)"}
-    try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-            r = await client.post(url, data=params, headers=headers)
-            if r.status_code != 200:
-                return {"status": "unavailable", "error": f"HTTP {r.status_code}", "results": []}
-            html = r.text
-
-        # Parse result blocks
-        results = []
-        # DuckDuckGo HTML result structure: <a class="result__a" href="URL">TITLE</a>
-        # and <a class="result__snippet">SNIPPET</a>
-        blocks = re.findall(
-            r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>.*?'
-            r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
-            html, re.DOTALL | re.IGNORECASE,
-        )
-        for href, title, snippet in blocks[:limit]:
-            title = re.sub(r'<[^>]+>', '', title).strip()
-            snippet = re.sub(r'<[^>]+>', '', snippet).strip()
-            # Decode DuckDuckGo redirect wrapper
-            if "uddg=" in href:
-                m = re.search(r'uddg=([^&]+)', href)
-                if m:
-                    href = m.group(1)
-            results.append({
-                "title": title[:200],
-                "url": href[:500],
-                "snippet": snippet[:300],
-            })
-        return {"status": "success", "error": None, "results": results}
-    except Exception as e:
-        return {"status": "unavailable", "error": str(e)[:120], "results": []}
-
-
-async def search_bing(email: str, limit: int = 15) -> dict:
-    """Search Bing HTML for the exact email."""
-    url = "https://www.bing.com/search"
-    params = {"q": f'"{email}"'}
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; OSINT-Infosys/0.14)"}
-    try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-            r = await client.get(url, params=params, headers=headers)
-            if r.status_code != 200:
-                return {"status": "unavailable", "error": f"HTTP {r.status_code}", "results": []}
-            html = r.text
-
-        results = []
-        # Bing: <li class="b_algo"><h2><a href="URL">TITLE</a></h2>...<p>SNIPPET</p>
-        blocks = re.findall(
-            r'<li class="b_algo".*?<h2><a[^>]+href="([^"]+)"[^>]*>(.*?)</a></h2>.*?<p[^>]*>(.*?)</p>',
-            html, re.DOTALL | re.IGNORECASE,
-        )
-        for href, title, snippet in blocks[:limit]:
-            title = re.sub(r'<[^>]+>', '', title).strip()
-            snippet = re.sub(r'<[^>]+>', '', snippet).strip()
-            results.append({
-                "title": title[:200],
-                "url": href[:500],
-                "snippet": snippet[:300],
-            })
-        return {"status": "success", "error": None, "results": results}
-    except Exception as e:
-        return {"status": "unavailable", "error": str(e)[:120], "results": []}
-
-
-async def discover_public_references(email: str) -> dict:
-    """Run DuckDuckGo and Bing searches concurrently, dedupe by URL."""
-    dd, bing = await asyncio.gather(
-        search_duckduckgo(email),
-        search_bing(email),
-    )
-    combined = []
-    seen_urls = set()
-    for source_name, source in [("DuckDuckGo", dd), ("Bing", bing)]:
-        for r in source["results"]:
-            u = r["url"]
-            if u in seen_urls:
-                continue
-            seen_urls.add(u)
-            combined.append({
-                "source": source_name,
-                "title": r["title"],
-                "url": u,
-                "snippet": r["snippet"],
-            })
-    return {
-        "duckduckgo": dd["status"],
-        "duckduckgo_error": dd["error"],
-        "bing": bing["status"],
-        "bing_error": bing["error"],
-        "results": combined,
-    }
-
-
-# ---------------------------------------------------------------- background job
-async def run_job(job_id: str, email: str):
-    def update(status, result=None, error=None):
-        with db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE jobs SET status=%s, result=%s, error=%s, updated_at=NOW() WHERE job_id=%s",
-                    (status, json.dumps(result) if result else None, error, job_id),
-                )
-
-    update("running")
-    log.info(f"Job {job_id}: running for {email}")
-
-    try:
-        holehe_result, public_refs = await asyncio.gather(
-            run_holehe(email),
-            discover_public_references(email),
-        )
-        result = {
-            "email": email,
-            "holehe": holehe_result,
-            "public_references": public_refs,
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-        }
-        update("done", result=result)
-        log.info(f"Job {job_id}: done ({len(holehe_result.get('found', []))} found, "
-                 f"{len(holehe_result.get('rate_limited', []))} rate-limited, "
-                 f"{len(public_refs.get('results', []))} public refs)")
-    except Exception as e:
-        log.exception(f"Job {job_id}: failed")
-        update("failed", error=str(e))
-
-
-# ---------------------------------------------------------------- API
+# ---------- API ----------
 class CheckRequest(BaseModel):
     email: str = Field(min_length=3, max_length=320)
 
 
-@app.post("/api/check")
+@app.post("/api/check", dependencies=[Depends(require_auth)])
 async def start_check(req: CheckRequest, bg: BackgroundTasks):
-    if "@" not in req.email or "." not in req.email.rpartition("@")[2]:
-        raise HTTPException(400, "Invalid email format")
+    email, domain = normalize_email(req.email)
     job_id = str(uuid.uuid4())
-    with db() as conn:
+    encrypted_email = cipher.encrypt(email.encode()).decode()
+    digest = hashlib.sha256(email.encode()).hexdigest()
+    with db_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO jobs (job_id, status, email) VALUES (%s, 'pending', %s)",
-                (job_id, req.email),
-            )
-    bg.add_task(run_job, job_id, req.email)
-    return {"jobId": job_id}
+            cur.execute("""
+                INSERT INTO jobs_v0151 (job_id,status,email_ciphertext,email_sha256)
+                VALUES (%s,'pending',%s,%s)
+            """, (job_id, encrypted_email, digest))
+    bg.add_task(execute_investigation, job_id, email, domain)
+    return {"jobId": job_id, "status": "pending"}
 
 
-@app.get("/api/job/{job_id}")
+@app.get("/api/job/{job_id}", dependencies=[Depends(require_auth)])
 async def get_job(job_id: str):
-    with db() as conn:
+    try:
+        uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(400, detail="Invalid job ID")
+    with db_connection() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT * FROM jobs WHERE job_id=%s", (job_id,))
+            cur.execute("""
+                SELECT job_id,status,result_ciphertext,error,created_at,updated_at,
+                       started_at,completed_at,last_heartbeat_at
+                FROM jobs_v0151 WHERE job_id=%s
+            """, (job_id,))
             row = cur.fetchone()
-            if not row:
-                raise HTTPException(404, "Job not found")
-            return dict(row)
+    if not row:
+        raise HTTPException(404, detail="Job not found")
+    payload = dict(row)
+    ciphertext = payload.pop("result_ciphertext", None)
+    if ciphertext:
+        try:
+            payload["result"] = json.loads(cipher.decrypt(ciphertext.encode()).decode())
+        except (InvalidToken, ValueError):
+            payload["result"] = None
+            payload["error"] = "Result could not be decrypted (encryption key changed?)"
+    return payload
 
 
-@app.get("/healthz")
-async def healthz():
-    return {"status": "ok", "version": "0.14.0"}
-
-
-# ---------------------------------------------------------------- frontend
-HTML = """<!DOCTYPE html>
+HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OSINT Infosys</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OSINT Infosys v0.15.1</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-     background:#0a0a0a;color:#e5e7eb;min-height:100vh;padding:20px}
-.container{max-width:900px;margin:0 auto}
-header{text-align:center;padding:30px 0 20px}
-h1{color:#10b981;font-size:28px;margin-bottom:8px}
-.sub{color:#6b7280;font-size:13px;margin-bottom:4px}
-.warn{color:#f59e0b;font-size:11px;margin-top:8px}
-.search{background:#111;border:1px solid #222;border-radius:12px;padding:20px;margin-bottom:20px}
-input{width:100%;padding:16px;font-size:16px;background:#0a0a0a;
-      border:1px solid #333;border-radius:8px;color:#fff;margin-bottom:12px}
-input:focus{outline:none;border-color:#10b981}
-button{width:100%;padding:16px;font-size:16px;font-weight:600;background:#10b981;
-       color:#000;border:none;border-radius:8px;cursor:pointer}
+*{box-sizing:border-box}
+body{margin:0;padding:18px;background:#090d12;color:#e5e7eb;font:15px -apple-system,BlinkMacSystemFont,system-ui,sans-serif}
+main{max-width:850px;margin:auto}
+header{text-align:center;padding:24px 0}
+h1{color:#34d399;margin:0;font-size:26px}
+.sub{color:#9ca3af;font-size:12px;margin:6px 0}
+.panel{background:#111923;border:1px solid #263342;border-radius:12px;padding:16px;margin:14px 0}
+input{width:100%;padding:12px;background:#080d13;border:1px solid #374151;border-radius:8px;color:white;margin:6px 0;font-size:15px}
+button{width:100%;padding:14px;border:0;border-radius:8px;background:#34d399;color:#000;font-weight:700;margin-top:10px;cursor:pointer;font-size:15px}
 button:disabled{opacity:.5;cursor:not-allowed}
-.status{padding:14px;border-radius:8px;margin-bottom:16px;font-size:13px}
-.status.running{background:#1e3a8a33;color:#60a5fa;border:1px solid #1e40af66}
-.status.error{background:#7f1d1d33;color:#fca5a5;border:1px solid #991b1b66}
-.card{background:#111;border:1px solid #222;border-radius:12px;padding:16px;margin-bottom:16px}
-.card h2{font-size:14px;color:#10b981;text-transform:uppercase;letter-spacing:1px;
-         margin-bottom:14px;display:flex;justify-content:space-between;align-items:center}
-.count{background:#064e3b;color:#6ee7b7;padding:4px 10px;border-radius:20px;font-size:12px}
-.count.amber{background:#78350f;color:#fbbf24}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px}
-.platform{background:#1f2937;padding:10px 12px;border-radius:6px;font-size:13px;
-          border-left:3px solid #10b981;word-break:break-all}
-.ref{background:#111827;border:1px solid #374151;border-radius:8px;padding:12px;
-     margin-bottom:10px}
-.ref .ref-source{font-size:10px;color:#6b7280;text-transform:uppercase;margin-bottom:4px}
-.ref .ref-title{font-size:14px;color:#e5e7eb;font-weight:600;margin-bottom:4px;line-height:1.4}
-.ref .ref-url{font-size:11px;color:#10b981;word-break:break-all;margin-bottom:6px}
-.ref .ref-snippet{font-size:12px;color:#9ca3af;line-height:1.5}
-.footer{text-align:center;font-size:11px;color:#4b5563;padding:30px 0 20px;line-height:1.8}
-details.rl{border:1px solid #78350f;background:#1c1917;border-radius:8px;padding:12px;margin-top:12px}
-details.rl summary{cursor:pointer;font-size:12px;color:#fbbf24;font-weight:600}
-details.rl .rl-note{font-size:11px;color:#9ca3af;margin:8px 0;line-height:1.5}
-details.rl .rl-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
-details.rl .rl-tags span{background:#292524;color:#fbbf24;padding:3px 8px;border-radius:4px;
-                         font-size:10px;font-family:monospace;word-break:break-all}
-.empty{color:#6b7280;font-size:13px;font-style:italic}
+button.link{background:transparent;color:#9ca3af;font-weight:400;font-size:12px;margin:0;padding:4px 0;text-align:right;width:auto}
+label{font-size:13px;color:#d1d5db}
+.warn{color:#fbbf24;font-size:11px}
+.muted{color:#9ca3af;font-size:12px}
+.status{padding:12px;border-radius:8px;background:#172b42;margin:12px 0;font-size:13px}
+.error{background:#3b1d1d;color:#fca5a5}
+.item{border-bottom:1px solid #263342;padding:10px 0;word-wrap:break-word;overflow-wrap:anywhere}
+.item:last-child{border:0}
+.pill{font-size:10px;padding:2px 7px;border-radius:10px;background:#1f2937;color:#d1d5db;margin-left:6px}
+.pill.found{background:#065f46;color:#6ee7b7}
+.pill.rate{background:#78350f;color:#fbbf24}
+.pill.error{background:#7f1d1d;color:#fca5a5}
+a{color:#6ee7b7;word-break:break-all}
+.bad{color:#fca5a5}
+hr{border:0;border-top:1px solid #263342;margin:14px 0}
+summary{cursor:pointer;color:#fbbf24;font-weight:600;font-size:13px}
+details{margin-top:8px}
 </style>
 </head>
 <body>
-<div class="container">
-  <header>
-    <h1>OSINT Infosys</h1>
-    <p class="sub">Email intelligence investigation</p>
-    <p class="warn">For authorized investigations only</p>
-  </header>
+<main>
+<header>
+  <h1>OSINT Infosys</h1>
+  <p class="sub">Email intelligence · v0.15.1</p>
+  <p class="warn">Authorized investigations only · findings are leads, not identity proof</p>
+</header>
 
-  <div class="search">
-    <input id="email" type="email" placeholder="Enter email address"
-           autocomplete="off" inputmode="email">
-    <button id="run" onclick="runCheck()">Investigate</button>
-  </div>
+<section class="panel" id="auth-panel" style="display:none">
+  <label>API token (paste once — saved in this browser)</label>
+  <input id="token" type="password" autocomplete="off" placeholder="Paste your OSINT_API_TOKEN">
+  <button onclick="saveToken()">Save &amp; Continue</button>
+  <p class="muted">Stored only in your browser's localStorage. Clear via the Forget button later.</p>
+</section>
 
-  <div id="status"></div>
-  <div id="results"></div>
+<section class="panel" id="search-panel" style="display:none">
+  <label>Email address</label>
+  <input id="email" type="email" autocomplete="off" inputmode="email" placeholder="name@example.com">
+  <button id="run" onclick="runCheck()">Investigate</button>
+  <button class="link" onclick="forgetToken()">Forget saved token</button>
+  <p class="muted">⚠️ External checks send this email to Holehe and DuckDuckGo/Bing. Use only for authorized investigations.</p>
+</section>
 
-  <div class="footer">
-    Holehe platform registrations · DuckDuckGo/Bing public references<br>
-    All findings require manual verification
-  </div>
-</div>
+<div id="status"></div>
+<div id="results"></div>
 
+</main>
 <script>
-let pollTimer = null;
+const TOKEN_KEY = "osint_api_token_v0151";
+let pollHandle = null;
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function getToken() { return localStorage.getItem(TOKEN_KEY) || ''; }
+
+function saveToken() {
+  const t = document.getElementById('token').value.trim();
+  if (t.length < 32) { alert('Token must be at least 32 characters.'); return; }
+  localStorage.setItem(TOKEN_KEY, t);
+  showSearch();
+}
+
+function forgetToken() {
+  localStorage.removeItem(TOKEN_KEY);
+  document.getElementById('auth-panel').style.display = 'block';
+  document.getElementById('search-panel').style.display = 'none';
+}
+
+function showSearch() {
+  document.getElementById('auth-panel').style.display = 'none';
+  document.getElementById('search-panel').style.display = 'block';
+}
+
+function authHeaders() {
+  return {'Authorization': 'Bearer ' + getToken(), 'Content-Type': 'application/json'};
+}
 
 async function runCheck() {
   const email = document.getElementById('email').value.trim();
-  if (!email) return;
-  document.getElementById('run').disabled = true;
-  document.getElementById('run').textContent = 'Investigating...';
+  if (!email) { alert('Enter an email address.'); return; }
+  const btn = document.getElementById('run');
+  btn.disabled = true;
+  btn.textContent = 'Investigating…';
   document.getElementById('results').innerHTML = '';
-  document.getElementById('status').innerHTML =
-    '<div class="status running">Running Holehe + DuckDuckGo + Bing. First run after idle can take 60-120s.</div>';
+  document.getElementById('status').innerHTML = '<div class="status">Starting investigation. First run after idle may take 60–120s.</div>';
   try {
-    const res = await fetch('/api/check', {
+    const r = await fetch('/api/check', {
       method: 'POST',
-      headers: {'Content-Type':'application/json'},
+      headers: authHeaders(),
       body: JSON.stringify({email})
     });
-    if (!res.ok) throw new Error('Server error: ' + res.status);
-    const {jobId} = await res.json();
-    poll(jobId);
-  } catch (e) { showError(e.message); }
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || ('HTTP ' + r.status));
+    poll(data.jobId);
+  } catch (e) {
+    showError(e.message);
+  }
 }
 
-function poll(jobId) {
-  pollTimer = setInterval(async () => {
+function poll(id) {
+  let attempts = 0;
+  clearInterval(pollHandle);
+  pollHandle = setInterval(async () => {
+    attempts++;
+    if (attempts > 100) {
+      clearInterval(pollHandle);
+      showError('Polling limit reached. Check again later — do not assume completion.');
+      return;
+    }
     try {
-      const res = await fetch('/api/job/' + jobId);
-      const job = await res.json();
-      if (job.status === 'done') {
-        clearInterval(pollTimer);
-        renderResults(job.result);
-        document.getElementById('status').innerHTML = '';
+      const r = await fetch('/api/job/' + encodeURIComponent(id), {headers: authHeaders()});
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.detail || ('HTTP ' + r.status));
+      if (['done','failed','interrupted'].includes(j.status)) {
+        clearInterval(pollHandle);
         document.getElementById('run').disabled = false;
         document.getElementById('run').textContent = 'Investigate';
-      } else if (job.status === 'failed') {
-        clearInterval(pollTimer);
-        showError(job.error || 'Investigation failed');
+        if (j.status === 'done') render(j.result);
+        else showError('Job ' + j.status + ': ' + (j.error || 'unknown'));
+      } else {
+        document.getElementById('status').innerHTML = '<div class="status">Job ' + esc(j.status) + '…</div>';
       }
-    } catch (e) { clearInterval(pollTimer); showError('Polling error: ' + e.message); }
-  }, 3000);
+    } catch (e) {
+      clearInterval(pollHandle);
+      showError(e.message);
+    }
+  }, 2500);
 }
 
 function showError(msg) {
   document.getElementById('run').disabled = false;
   document.getElementById('run').textContent = 'Investigate';
-  document.getElementById('status').innerHTML =
-    '<div class="status error">Error: ' + escapeHtml(msg) + '</div>';
+  document.getElementById('status').innerHTML = '<div class="status error">' + esc(msg) + '</div>';
 }
 
-function renderResults(r) {
-  const h = r.holehe || {};
-  const found = h.found || [];
-  const notFound = h.not_found || [];
-  const rateLimited = h.rate_limited || [];
-  const publicRefs = r.public_references || {};
-  const refs = publicRefs.results || [];
-  let html = '';
+function render(r) {
+  document.getElementById('status').innerHTML = '<div class="status">Completed. Empty result is not proof of absence — review source statuses below.</div>';
+  let out = '';
 
-  // ---- Public references (most useful section first)
-  html += '<div class="card">';
-  html += '<h2>Public Web References <span class="count">' + refs.length + ' found</span></h2>';
-  const ddStatus = publicRefs.duckduckgo || 'unknown';
-  const bingStatus = publicRefs.bing || 'unknown';
-  html += '<p style="color:#6b7280;font-size:11px;margin-bottom:12px">Searched DuckDuckGo (' + ddStatus + ') and Bing (' + bingStatus + ') for the exact email string.</p>';
-  if (refs.length === 0) {
-    html += '<p class="empty">No public web pages mentioned this email. This is a negative result from public search, not proof of absence.</p>';
-  } else {
-    refs.forEach(ref => {
-      html += '<div class="ref">';
-      html += '<div class="ref-source">' + escapeHtml(ref.source) + '</div>';
-      html += '<div class="ref-title">' + escapeHtml(ref.title) + '</div>';
-      html += '<a class="ref-url" href="' + escapeHtml(ref.url) + '" target="_blank" rel="noopener">' + escapeHtml(ref.url) + '</a>';
-      if (ref.snippet) {
-        html += '<div class="ref-snippet">' + escapeHtml(ref.snippet) + '</div>';
-      }
-      html += '</div>';
-    });
+  for (const [key, val] of Object.entries(r.sources || {})) {
+    if (key === 'dns') {
+      for (const [k, v] of Object.entries(val || {})) out += section('DNS · ' + k, v);
+    } else {
+      out += section(key, val);
+    }
   }
-  html += '</div>';
 
-  // ---- Holehe platform registrations
-  html += '<div class="card">';
-  const totalChecked = found.length + notFound.length + rateLimited.length;
-  html += '<h2>Platform Registrations <span class="count">' + found.length + ' found</span> ' +
-          '<span class="count amber">' + rateLimited.length + ' rate-limited</span></h2>';
-  if (h.status === 'timeout' || h.status === 'error') {
-    html += '<p style="color:#fca5a5;font-size:13px">Holehe scan ' +
-            (h.status === 'timeout' ? 'timed out' : 'failed: ' + escapeHtml(h.error || '')) + '</p>';
-  } else if (found.length === 0) {
-    html += '<p class="empty">No platform registrations detected. May be rate-limited on all platforms.</p>';
-  } else {
-    html += '<div class="grid">';
-    found.forEach(p => { html += '<div class="platform">' + escapeHtml(p) + '</div>'; });
-    html += '</div>';
+  out += '<section class="panel"><h3>Public references (' + (r.public_references || []).length + ')</h3>';
+  for (const x of (r.public_references || [])) {
+    const u = String(x.url || '');
+    let safe = false;
+    try { const p = new URL(u); safe = ['http:','https:'].includes(p.protocol); } catch {}
+    out += '<div class="item"><b>' + esc(x.title || '(untitled)') + '</b>';
+    out += '<p class="muted">' + esc(x.discovery_source || '') + '</p>';
+    if (safe) out += '<a href="' + esc(u) + '" target="_blank" rel="noopener noreferrer">' + esc(u) + '</a>';
+    if (x.snippet) out += '<p class="muted">' + esc(x.snippet) + '</p>';
+    out += '</div>';
   }
-  if (totalChecked > 0) {
-    html += '<p style="color:#6b7280;font-size:11px;margin-top:12px">Checked ' + totalChecked +
-            ' platforms · ' + found.length + ' found · ' + notFound.length + ' not found · ' +
-            rateLimited.length + ' rate-limited</p>';
-  }
-  if (rateLimited.length > 0) {
-    const pct = totalChecked > 0 ? Math.round(100 * rateLimited.length / totalChecked) : 0;
-    html += '<details class="rl">';
-    html += '<summary>' + rateLimited.length + ' platforms rate-limited (' + pct +
-            '% of checked) — click to see which</summary>';
-    html += '<p class="rl-note">The Render shared IP was blocked by these platforms. This is a coverage limit, not a negative result. Use Sherlock, DuckDuckGo, or a different engine to compensate.</p>';
-    html += '<div class="rl-tags">';
-    rateLimited.forEach(p => { html += '<span>' + escapeHtml(p) + '</span>'; });
-    html += '</div></details>';
-  }
-  html += '</div>';
+  out += '</section>';
 
-  document.getElementById('results').innerHTML = html;
+  out += '<section class="panel"><b>Assessment: ' + esc(r.assessment?.conclusion || 'unresolved') + '</b>';
+  if (r.assessment?.note) out += '<p class="muted">' + esc(r.assessment.note) + '</p>';
+  out += '</section>';
+
+  document.getElementById('results').innerHTML = out;
 }
 
-function escapeHtml(s) {
-  const d = document.createElement('div');
-  d.textContent = String(s == null ? '' : s);
-  return d.innerHTML;
+function section(name, v) {
+  const status = v?.status || 'unknown';
+  const pillClass = status === 'found' ? 'found' : status === 'rate_limited' ? 'rate' : status === 'error' ? 'error' : '';
+  let body = '';
+  if (v?.found?.length) body += '<p>Found: ' + esc(v.found.join(', ')) + '</p>';
+  if (v?.rate_limited?.length) {
+    const total = (v.found?.length || 0) + (v.not_found?.length || 0) + (v.rate_limited?.length || 0);
+    const pct = total > 0 ? Math.round(100 * v.rate_limited.length / total) : 0;
+    body += '<details><summary>' + v.rate_limited.length + ' platforms rate-limited (' + pct + '%) — click to see which</summary>';
+    body += '<p class="muted">Blocked by provider rate limits, not a negative result. The Render shared IP is the likely cause.</p>';
+    body += '<p>' + esc(v.rate_limited.join(', ')) + '</p></details>';
+  }
+  if (v?.not_found?.length) body += '<p class="muted">Not found: ' + esc(v.not_found.join(', ')) + '</p>';
+  if (v?.values?.length) body += '<p>' + esc(v.values.join(', ')) + '</p>';
+  if (v?.results?.length) body += '<p>' + v.results.length + ' reference(s)</p>';
+  if (v?.error) body += '<p class="bad">Error: ' + esc(v.error) + '</p>';
+  if (v?.limitation) body += '<p class="muted">' + esc(v.limitation) + '</p>';
+  return '<section class="panel"><h3>' + esc(name) + ' <span class="pill ' + pillClass + '">' + esc(status) + '</span></h3>' + body + '</section>';
 }
+
+// On load: decide auth vs search
+if (getToken()) showSearch();
+else document.getElementById('auth-panel').style.display = 'block';
 </script>
 </body>
-</html>
-"""
+</html>"""
 
 
 @app.get("/", response_class=HTMLResponse)
