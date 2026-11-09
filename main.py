@@ -1,6 +1,6 @@
 """
-OSINT Infosys v0.13.2 — Email Intelligence
-Holehe platform registrations + similar-email candidate discovery.
+OSINT Infosys v0.14 — Email Intelligence
+DNS + Holehe + DuckDuckGo/Bing public references.
 """
 import os
 import sys
@@ -9,8 +9,10 @@ import asyncio
 import hashlib
 import uuid
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 import psycopg2
@@ -26,7 +28,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is required")
 
-app = FastAPI(title="OSINT Infosys", version="0.13.2")
+app = FastAPI(title="OSINT Infosys", version="0.14.0")
 
 
 # ---------------------------------------------------------------- storage
@@ -54,7 +56,7 @@ def init_db():
 
 @app.on_event("startup")
 async def startup_event():
-    log.info("OSINT Infosys v0.13.2 starting")
+    log.info("OSINT Infosys v0.14.0 starting")
     init_db()
     log.info("Database: initialized")
     for cmd in [["holehe", "--version"], [sys.executable, "-m", "holehe", "--version"]]:
@@ -78,10 +80,11 @@ async def root_head():
 
 # ---------------------------------------------------------------- holehe
 async def run_holehe(email: str) -> dict:
+    """Run holehe WITHOUT --only-used so we see found + not-found + rate-limited."""
     commands = [
-        ["holehe", email, "--only-used", "--no-color"],
-        ["python", "-m", "holehe", email, "--only-used", "--no-color"],
-        [sys.executable, "-m", "holehe", email, "--only-used", "--no-color"],
+        ["holehe", email, "--no-color"],
+        ["python", "-m", "holehe", email, "--no-color"],
+        [sys.executable, "-m", "holehe", email, "--no-color"],
     ]
     last_error = None
     for cmd in commands:
@@ -92,11 +95,11 @@ async def run_holehe(email: str) -> dict:
                 stderr=asyncio.subprocess.PIPE,
             )
             try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=150)
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
             except asyncio.TimeoutError:
                 proc.kill()
                 return {"status": "timeout", "found": [], "not_found": [],
-                        "rate_limited": [], "error": "Holehe timed out after 150s"}
+                        "rate_limited": [], "error": "Holehe timed out after 180s"}
 
             output = stdout.decode("utf-8", errors="ignore")
             found, not_found, rate_limited = [], [], []
@@ -104,7 +107,6 @@ async def run_holehe(email: str) -> dict:
                 line = line.strip()
                 if not line:
                     continue
-                # Skip the summary legend that Holehe prints at the bottom
                 if "Email used" in line or "Email not used" in line or "Rate limit" in line:
                     continue
                 if line.startswith("[+]"):
@@ -138,72 +140,104 @@ async def run_holehe(email: str) -> dict:
             "found": [], "not_found": [], "rate_limited": [], "total": 0}
 
 
-# ---------------------------------------------------------------- similar emails
-def generate_variants(email: str, limit: int = 10) -> list[str]:
-    local, _, domain = email.lower().rpartition("@")
-    if not local or not domain:
-        return []
-
-    variants: list[str] = []
-    parts = local.split(".")
-
-    if len(parts) > 1:
-        variants.append(".".join(reversed(parts)))
-        variants.append("".join(reversed(parts)))
-        variants.append("_".join(parts))
-        variants.append("".join(parts))
-
-    for suffix in ("93", "99", "01", "90", "1", "127", "123"):
-        variants.append(f"{local}{suffix}")
-        if parts:
-            variants.append(f"{parts[0]}{suffix}")
-
-    seen = {local}
-    out = []
-    for v in variants:
-        if v and v not in seen:
-            seen.add(v)
-            out.append(f"{v}@{domain}")
-            if len(out) >= limit:
-                break
-    return out
-
-
-async def fetch_gravatar(email: str) -> dict:
-    md5 = hashlib.md5(email.strip().lower().encode()).hexdigest()
-    url = f"https://www.gravatar.com/avatar/{md5}?d=404&s=200"
+# ---------------------------------------------------------------- public web search
+async def search_duckduckgo(email: str, limit: int = 15) -> dict:
+    """Search DuckDuckGo HTML for the exact email."""
+    url = "https://html.duckduckgo.com/html/"
+    params = {"q": f'"{email}"'}
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; OSINT-Infosys/0.14)"}
     try:
-        async with httpx.AsyncClient(timeout=6.0, follow_redirects=True) as client:
-            r = await client.get(url)
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            r = await client.post(url, data=params, headers=headers)
             if r.status_code != 200:
-                return {"exists": False, "md5": md5, "url": None, "image_sha": None}
-            return {
-                "exists": True, "md5": md5, "url": url,
-                "image_sha": hashlib.sha256(r.content).hexdigest(),
-            }
-    except Exception:
-        return {"exists": False, "md5": md5, "url": None, "image_sha": None}
+                return {"status": "unavailable", "error": f"HTTP {r.status_code}", "results": []}
+            html = r.text
+
+        # Parse result blocks
+        results = []
+        # DuckDuckGo HTML result structure: <a class="result__a" href="URL">TITLE</a>
+        # and <a class="result__snippet">SNIPPET</a>
+        blocks = re.findall(
+            r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>.*?'
+            r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
+            html, re.DOTALL | re.IGNORECASE,
+        )
+        for href, title, snippet in blocks[:limit]:
+            title = re.sub(r'<[^>]+>', '', title).strip()
+            snippet = re.sub(r'<[^>]+>', '', snippet).strip()
+            # Decode DuckDuckGo redirect wrapper
+            if "uddg=" in href:
+                m = re.search(r'uddg=([^&]+)', href)
+                if m:
+                    href = m.group(1)
+            results.append({
+                "title": title[:200],
+                "url": href[:500],
+                "snippet": snippet[:300],
+            })
+        return {"status": "success", "error": None, "results": results}
+    except Exception as e:
+        return {"status": "unavailable", "error": str(e)[:120], "results": []}
 
 
-async def discover_similar(email: str) -> list[dict]:
-    variants = generate_variants(email)
-    target = await fetch_gravatar(email)
-    candidates = []
-    for v in variants:
-        g = await fetch_gravatar(v)
-        if g["exists"] and target["exists"] and g["image_sha"] == target["image_sha"]:
-            signal, reason = "HIGH", "Gravatar avatar matches target's avatar exactly. Weak ownership signal — not proof."
-        elif g["exists"] and target["exists"]:
-            signal, reason = "MEDIUM", "Gravatar avatar exists, but the image differs from target's. Weak signal."
-        elif g["exists"]:
-            signal, reason = "MEDIUM", "Gravatar avatar exists (target has none to compare)."
-        else:
-            signal, reason = "NONE", "No Gravatar exists. This variant was generated from rules only — zero evidence."
-        candidates.append({
-            "email": v, "signal": signal, "reason": reason,
-            "gravatar_url": g.get("url"),
-        })
-    return candidates
+async def search_bing(email: str, limit: int = 15) -> dict:
+    """Search Bing HTML for the exact email."""
+    url = "https://www.bing.com/search"
+    params = {"q": f'"{email}"'}
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; OSINT-Infosys/0.14)"}
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            r = await client.get(url, params=params, headers=headers)
+            if r.status_code != 200:
+                return {"status": "unavailable", "error": f"HTTP {r.status_code}", "results": []}
+            html = r.text
+
+        results = []
+        # Bing: <li class="b_algo"><h2><a href="URL">TITLE</a></h2>...<p>SNIPPET</p>
+        blocks = re.findall(
+            r'<li class="b_algo".*?<h2><a[^>]+href="([^"]+)"[^>]*>(.*?)</a></h2>.*?<p[^>]*>(.*?)</p>',
+            html, re.DOTALL | re.IGNORECASE,
+        )
+        for href, title, snippet in blocks[:limit]:
+            title = re.sub(r'<[^>]+>', '', title).strip()
+            snippet = re.sub(r'<[^>]+>', '', snippet).strip()
+            results.append({
+                "title": title[:200],
+                "url": href[:500],
+                "snippet": snippet[:300],
+            })
+        return {"status": "success", "error": None, "results": results}
+    except Exception as e:
+        return {"status": "unavailable", "error": str(e)[:120], "results": []}
+
+
+async def discover_public_references(email: str) -> dict:
+    """Run DuckDuckGo and Bing searches concurrently, dedupe by URL."""
+    dd, bing = await asyncio.gather(
+        search_duckduckgo(email),
+        search_bing(email),
+    )
+    combined = []
+    seen_urls = set()
+    for source_name, source in [("DuckDuckGo", dd), ("Bing", bing)]:
+        for r in source["results"]:
+            u = r["url"]
+            if u in seen_urls:
+                continue
+            seen_urls.add(u)
+            combined.append({
+                "source": source_name,
+                "title": r["title"],
+                "url": u,
+                "snippet": r["snippet"],
+            })
+    return {
+        "duckduckgo": dd["status"],
+        "duckduckgo_error": dd["error"],
+        "bing": bing["status"],
+        "bing_error": bing["error"],
+        "results": combined,
+    }
 
 
 # ---------------------------------------------------------------- background job
@@ -220,19 +254,20 @@ async def run_job(job_id: str, email: str):
     log.info(f"Job {job_id}: running for {email}")
 
     try:
-        holehe_result, similar = await asyncio.gather(
+        holehe_result, public_refs = await asyncio.gather(
             run_holehe(email),
-            discover_similar(email),
+            discover_public_references(email),
         )
         result = {
             "email": email,
             "holehe": holehe_result,
-            "similar_emails": similar,
+            "public_references": public_refs,
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
         update("done", result=result)
         log.info(f"Job {job_id}: done ({len(holehe_result.get('found', []))} found, "
-                 f"{len(holehe_result.get('rate_limited', []))} rate-limited)")
+                 f"{len(holehe_result.get('rate_limited', []))} rate-limited, "
+                 f"{len(public_refs.get('results', []))} public refs)")
     except Exception as e:
         log.exception(f"Job {job_id}: failed")
         update("failed", error=str(e))
@@ -271,7 +306,7 @@ async def get_job(job_id: str):
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "version": "0.13.2"}
+    return {"status": "ok", "version": "0.14.0"}
 
 
 # ---------------------------------------------------------------- frontend
@@ -304,23 +339,16 @@ button:disabled{opacity:.5;cursor:not-allowed}
 .card h2{font-size:14px;color:#10b981;text-transform:uppercase;letter-spacing:1px;
          margin-bottom:14px;display:flex;justify-content:space-between;align-items:center}
 .count{background:#064e3b;color:#6ee7b7;padding:4px 10px;border-radius:20px;font-size:12px}
+.count.amber{background:#78350f;color:#fbbf24}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px}
 .platform{background:#1f2937;padding:10px 12px;border-radius:6px;font-size:13px;
           border-left:3px solid #10b981;word-break:break-all}
-.candidate{background:#1c1917;border:1px solid #78350f;border-radius:8px;
-           padding:12px;margin-bottom:10px}
-.candidate.high{border-color:#10b981;background:#052e1f}
-.candidate.medium{border-color:#f59e0b}
-.candidate.none{border-color:#4b5563;background:#0a0a0a}
-.candidate .email{font-family:monospace;font-size:14px;color:#fff;margin-bottom:6px;
-                  word-break:break-all}
-.candidate .signal{display:inline-block;padding:3px 8px;border-radius:4px;
-                   font-size:10px;font-weight:700;margin-right:8px}
-.signal.HIGH{background:#065f46;color:#6ee7b7}
-.signal.MEDIUM{background:#78350f;color:#fbbf24}
-.signal.NONE{background:#374151;color:#9ca3af}
-.candidate .reason{font-size:11px;color:#9ca3af;margin-top:6px;line-height:1.5}
-.link{font-size:11px;color:#10b981;margin-top:8px;display:inline-block}
+.ref{background:#111827;border:1px solid #374151;border-radius:8px;padding:12px;
+     margin-bottom:10px}
+.ref .ref-source{font-size:10px;color:#6b7280;text-transform:uppercase;margin-bottom:4px}
+.ref .ref-title{font-size:14px;color:#e5e7eb;font-weight:600;margin-bottom:4px;line-height:1.4}
+.ref .ref-url{font-size:11px;color:#10b981;word-break:break-all;margin-bottom:6px}
+.ref .ref-snippet{font-size:12px;color:#9ca3af;line-height:1.5}
 .footer{text-align:center;font-size:11px;color:#4b5563;padding:30px 0 20px;line-height:1.8}
 details.rl{border:1px solid #78350f;background:#1c1917;border-radius:8px;padding:12px;margin-top:12px}
 details.rl summary{cursor:pointer;font-size:12px;color:#fbbf24;font-weight:600}
@@ -328,6 +356,7 @@ details.rl .rl-note{font-size:11px;color:#9ca3af;margin:8px 0;line-height:1.5}
 details.rl .rl-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
 details.rl .rl-tags span{background:#292524;color:#fbbf24;padding:3px 8px;border-radius:4px;
                          font-size:10px;font-family:monospace;word-break:break-all}
+.empty{color:#6b7280;font-size:13px;font-style:italic}
 </style>
 </head>
 <body>
@@ -335,20 +364,20 @@ details.rl .rl-tags span{background:#292524;color:#fbbf24;padding:3px 8px;border
   <header>
     <h1>OSINT Infosys</h1>
     <p class="sub">Email intelligence investigation</p>
-    <p class="warn">⚠️ For authorized investigations only</p>
+    <p class="warn">For authorized investigations only</p>
   </header>
 
   <div class="search">
     <input id="email" type="email" placeholder="Enter email address"
            autocomplete="off" inputmode="email">
-    <button id="run" onclick="runCheck()">🔍 Investigate</button>
+    <button id="run" onclick="runCheck()">Investigate</button>
   </div>
 
   <div id="status"></div>
   <div id="results"></div>
 
   <div class="footer">
-    Holehe platform registrations · Gravatar candidate discovery<br>
+    Holehe platform registrations · DuckDuckGo/Bing public references<br>
     All findings require manual verification
   </div>
 </div>
@@ -363,7 +392,7 @@ async function runCheck() {
   document.getElementById('run').textContent = 'Investigating...';
   document.getElementById('results').innerHTML = '';
   document.getElementById('status').innerHTML =
-    '<div class="status running">Scanning platforms via Holehe. First run after idle can take 60-120s.</div>';
+    '<div class="status running">Running Holehe + DuckDuckGo + Bing. First run after idle can take 60-120s.</div>';
   try {
     const res = await fetch('/api/check', {
       method: 'POST',
@@ -386,7 +415,7 @@ function poll(jobId) {
         renderResults(job.result);
         document.getElementById('status').innerHTML = '';
         document.getElementById('run').disabled = false;
-        document.getElementById('run').textContent = '🔍 Investigate';
+        document.getElementById('run').textContent = 'Investigate';
       } else if (job.status === 'failed') {
         clearInterval(pollTimer);
         showError(job.error || 'Investigation failed');
@@ -397,7 +426,7 @@ function poll(jobId) {
 
 function showError(msg) {
   document.getElementById('run').disabled = false;
-  document.getElementById('run').textContent = '🔍 Investigate';
+  document.getElementById('run').textContent = 'Investigate';
   document.getElementById('status').innerHTML =
     '<div class="status error">Error: ' + escapeHtml(msg) + '</div>';
 }
@@ -407,18 +436,42 @@ function renderResults(r) {
   const found = h.found || [];
   const notFound = h.not_found || [];
   const rateLimited = h.rate_limited || [];
-  const similar = r.similar_emails || [];
-  const totalChecked = found.length + notFound.length + rateLimited.length;
+  const publicRefs = r.public_references || {};
+  const refs = publicRefs.results || [];
   let html = '';
 
-  // Platform registrations
+  // ---- Public references (most useful section first)
   html += '<div class="card">';
-  html += '<h2>Platform Registrations <span class="count">' + found.length + ' found</span></h2>';
+  html += '<h2>Public Web References <span class="count">' + refs.length + ' found</span></h2>';
+  const ddStatus = publicRefs.duckduckgo || 'unknown';
+  const bingStatus = publicRefs.bing || 'unknown';
+  html += '<p style="color:#6b7280;font-size:11px;margin-bottom:12px">Searched DuckDuckGo (' + ddStatus + ') and Bing (' + bingStatus + ') for the exact email string.</p>';
+  if (refs.length === 0) {
+    html += '<p class="empty">No public web pages mentioned this email. This is a negative result from public search, not proof of absence.</p>';
+  } else {
+    refs.forEach(ref => {
+      html += '<div class="ref">';
+      html += '<div class="ref-source">' + escapeHtml(ref.source) + '</div>';
+      html += '<div class="ref-title">' + escapeHtml(ref.title) + '</div>';
+      html += '<a class="ref-url" href="' + escapeHtml(ref.url) + '" target="_blank" rel="noopener">' + escapeHtml(ref.url) + '</a>';
+      if (ref.snippet) {
+        html += '<div class="ref-snippet">' + escapeHtml(ref.snippet) + '</div>';
+      }
+      html += '</div>';
+    });
+  }
+  html += '</div>';
+
+  // ---- Holehe platform registrations
+  html += '<div class="card">';
+  const totalChecked = found.length + notFound.length + rateLimited.length;
+  html += '<h2>Platform Registrations <span class="count">' + found.length + ' found</span> ' +
+          '<span class="count amber">' + rateLimited.length + ' rate-limited</span></h2>';
   if (h.status === 'timeout' || h.status === 'error') {
     html += '<p style="color:#fca5a5;font-size:13px">Holehe scan ' +
             (h.status === 'timeout' ? 'timed out' : 'failed: ' + escapeHtml(h.error || '')) + '</p>';
   } else if (found.length === 0) {
-    html += '<p style="color:#9ca3af;font-size:13px">No platform registrations detected. This is not a negative finding — the email may still be registered on platforms Holehe could not reach.</p>';
+    html += '<p class="empty">No platform registrations detected. May be rate-limited on all platforms.</p>';
   } else {
     html += '<div class="grid">';
     found.forEach(p => { html += '<div class="platform">' + escapeHtml(p) + '</div>'; });
@@ -429,45 +482,18 @@ function renderResults(r) {
             ' platforms · ' + found.length + ' found · ' + notFound.length + ' not found · ' +
             rateLimited.length + ' rate-limited</p>';
   }
-  if (rateLimited.length > 0 && totalChecked > 0) {
-    const pct = Math.round(100 * rateLimited.length / totalChecked);
+  if (rateLimited.length > 0) {
+    const pct = totalChecked > 0 ? Math.round(100 * rateLimited.length / totalChecked) : 0;
     html += '<details class="rl">';
-    html += '<summary>⚠️ ' + rateLimited.length + ' platforms rate-limited (' + pct +
+    html += '<summary>' + rateLimited.length + ' platforms rate-limited (' + pct +
             '% of checked) — click to see which</summary>';
-    html += '<p class="rl-note">The Render shared IP was blocked by these platforms. This is a coverage limit, not a negative result. To check these properly you need a dedicated IP (Oracle VM) or a paid Render plan.</p>';
+    html += '<p class="rl-note">The Render shared IP was blocked by these platforms. This is a coverage limit, not a negative result. Use Sherlock, DuckDuckGo, or a different engine to compensate.</p>';
     html += '<div class="rl-tags">';
     rateLimited.forEach(p => { html += '<span>' + escapeHtml(p) + '</span>'; });
     html += '</div></details>';
   }
   html += '</div>';
 
-  // Similar emails
-  if (similar.length > 0) {
-    const high = similar.filter(s => s.signal === 'HIGH').length;
-    const med = similar.filter(s => s.signal === 'MEDIUM').length;
-    const none = similar.filter(s => s.signal === 'NONE').length;
-    html += '<div class="card">';
-    html += '<h2>Similar Email Candidates <span class="count">' + similar.length + ' total</span></h2>';
-    html += '<p style="color:#f59e0b;font-size:11px;margin-bottom:14px">⚠️ These are <b>generated variants</b> — the tool invents them from name-pattern rules, then checks Gravatar as the only signal. They are <b>not discovered accounts</b>. Verify each manually or ignore if you do not recognise them.</p>';
-    similar.forEach(s => {
-      const cls = s.signal === 'HIGH' ? 'high' : s.signal === 'MEDIUM' ? 'medium' : 'none';
-      const label = s.signal === 'HIGH' ? 'HIGH SIGNAL'
-                   : s.signal === 'MEDIUM' ? 'WEAK SIGNAL'
-                   : 'NO EVIDENCE';
-      html += '<div class="candidate ' + cls + '">';
-      html += '<div class="email">' + escapeHtml(s.email) + '</div>';
-      html += '<span class="signal ' + s.signal + '">' + label + '</span>';
-      html += '<div class="reason">' + escapeHtml(s.reason) + '</div>';
-      if (s.gravatar_url) {
-        html += '<a class="link" href="' + escapeHtml(s.gravatar_url) +
-                '" target="_blank" rel="noopener">Open Gravatar →</a>';
-      }
-      html += '</div>';
-    });
-    html += '<p style="color:#6b7280;font-size:11px;margin-top:12px">' +
-            high + ' high signal · ' + med + ' weak · ' + none + ' no evidence</p>';
-    html += '</div>';
-  }
   document.getElementById('results').innerHTML = html;
 }
 
