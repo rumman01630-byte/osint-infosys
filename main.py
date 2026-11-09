@@ -434,7 +434,7 @@ function renderResults(r) {
     html += '<details class="rl">';
     html += '<summary>⚠️ ' + rateLimited.length + ' platforms rate-limited (' + pct +
             '% of checked) — click to see which</summary>';
-    html += '<p class="rl-note">Render\'s shared IP was blocked by these platforms. This is a coverage limit, not a negative result. To check these properly you need a dedicated IP (Oracle VM) or a paid Render plan.</p>';
+    html += '<p class="rl-note">The Render shared IP was blocked by these platforms. This is a coverage limit, not a negative result. To check these properly you need a dedicated IP (Oracle VM) or a paid Render plan.</p>';
     html += '<div class="rl-tags">';
     rateLimited.forEach(p => { html += '<span>' + escapeHtml(p) + '</span>'; });
     html += '</div></details>';
