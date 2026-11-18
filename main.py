@@ -749,7 +749,7 @@ async def run_job(job_id, kind, payload):
 async def _email(email):
     domain = email.split("@")[1]
     derived = derive_usernames(email, 6)
-    sherlock_targets = derived[:3] if _sherlock else []
+    sherlock_targets = derived[:1] if _sherlock else []
 
     # Parallel engines
     tasks = {
@@ -779,7 +779,7 @@ async def _email(email):
             sherlock_results.append({"username": target, "status": "error",
                                      "found": [], "error": "exc"})
         else:
-            verified = await verify_sherlock(r.get("found", []), limit=15)
+                    verified = await verify_sherlock(r.get("found", []), limit=10)
             sherlock_results.append({**r, "found": verified})
 
     # Dedupe public refs
@@ -1007,9 +1007,9 @@ function forget(){localStorage.removeItem(K);document.getElementById('auth').sty
 function show(){document.getElementById('auth').style.display='none';document.getElementById('search').style.display='block'}
 function tab(t){['email','username','phone','domain'].forEach(x=>{document.getElementById('t-'+x).classList.toggle('active',x===t);document.getElementById('p-'+x).style.display=x===t?'block':'none'});document.getElementById('out').innerHTML='';document.getElementById('stat').innerHTML=''}
 function resetBtns(){const m={email:'Investigate Email',username:'Investigate Username',phone:'Investigate Phone',domain:'Investigate Domain'};for(const[k,v] of Object.entries(m)){const b=document.getElementById('r-'+k);if(b){b.disabled=false;b.textContent=v}}}
-function poll(id,type){let n=0;clearInterval(P);P=setInterval(async()=>{n++;if(n>200){clearInterval(P);resetBtns();err('Polling limit');return}try{const r=await fetch('/api/job/'+encodeURIComponent(id),{headers:H()});const j=await r.json();if(!r.ok)throw Error(j.detail||r.status);if(['done','failed','interrupted'].includes(j.status)){clearInterval(P);resetBtns();if(j.status==='done'){if(type==='email')showEmail(j.result);else if(type==='username')showUser(j.result);else if(type==='phone')showPhone(j.result);else showDomain(j.result)}else err('Job '+j.status+': '+(j.error||''))}else document.getElementById('stat').innerHTML='<div class="status">'+esc(j.status)+'… ('+(n*3)+'s)</div>'}catch(e){clearInterval(P);resetBtns();err(e.message)}},3000)}
+function poll(id,type){let n=0;clearInterval(P);P=setInterval(async()=>{n++;if(n>200){clearInterval(P);resetBtns();err('Polling limit');return}try{const r=await fetch('/api/job/'+encodeURIComponent(id),{headers:H()});const ct=r.headers.get('content-type')||'';if(!ct.includes('application/json')){if(n<100){document.getElementById('stat').innerHTML='<div class="status">Server restarting ('+r.status+'). Retrying… ('+(n*3)+'s)</div>';return}throw Error('HTTP '+r.status+' non-JSON (jobId: '+id+')')}const j=await r.json();if(!r.ok)throw Error(j.detail||r.status);if(['done','failed','interrupted'].includes(j.status)){clearInterval(P);resetBtns();if(j.status==='done'){if(type==='email')showEmail(j.result);else if(type==='username')showUser(j.result);else if(type==='phone')showPhone(j.result);else showDomain(j.result)}else err('Job '+j.status+': '+(j.error||''))}else document.getElementById('stat').innerHTML='<div class="status">'+esc(j.status)+'… ('+(n*3)+'s)</div>'}catch(e){clearInterval(P);resetBtns();err(e.message)}},3000)}
 function err(m){document.getElementById('stat').innerHTML='<div class="status error">'+esc(m)+'</div>'}
-async function go(url,body,type,btn){const b=document.getElementById(btn);b.disabled=true;b.textContent='Investigating…';document.getElementById('out').innerHTML='';document.getElementById('stat').innerHTML='<div class="status">Starting '+type+' investigation…</div>';try{const r=await fetch(url,{method:'POST',headers:H(),body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw Error(d.detail||r.status);poll(d.jobId,type)}catch(e){resetBtns();err(e.message)}}
+async function go(url,body,type,btn){const b=document.getElementById(btn);b.disabled=true;b.textContent='Investigating…';document.getElementById('out').innerHTML='';document.getElementById('stat').innerHTML='<div class="status">Starting '+type+' investigation…</div>';try{const r=await fetch(url,{method:'POST',headers:H(),body:JSON.stringify(body)});const ct=r.headers.get('content-type')||'';if(!ct.includes('application/json')){throw Error('Server returned non-JSON (HTTP '+r.status+'). Wait 60s and retry.')}const d=await r.json();if(!r.ok)throw Error(d.detail||r.status);poll(d.jobId,type)}catch(e){resetBtns();err(e.message)}}
 function runEmail(){const v=document.getElementById('in-email').value.trim();if(!v)return;go('/api/check',{email:v},'email','r-email')}
 function runUsername(){const v=document.getElementById('in-username').value.trim();if(!v)return;go('/api/check-username',{username:v},'username','r-username')}
 function runPhone(){const v=document.getElementById('in-phone').value.trim();if(!v)return;go('/api/check-phone',{phone:v},'phone','r-phone')}
