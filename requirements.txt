@@ -7,3 +7,4 @@ cryptography>=42,<46
 email-validator>=2.1,<3
 holehe==1.61
 sherlock-project>=0.16.2,<0.17
+phonenumbers>=8.13,<9
