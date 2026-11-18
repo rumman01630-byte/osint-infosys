@@ -1,7 +1,6 @@
 """
-OSINT Infosys v0.18.0 — multi-source email intelligence
-Engines: DNS, Holehe, Bing, DDG, Sherlock (5 variants), Gravatar Profile,
-Keybase, HackerNews, PGP keyservers. Plus Phone + Domain tabs.
+OSINT Infosys v0.18.1 — multi-source email intelligence (memory-safe)
+Fixes: Sherlock targets 3->1, verify limit 15->10, frontend JSON guard
 """
 from __future__ import annotations
 
@@ -36,7 +35,7 @@ from phonenumbers import carrier as pn_carrier
 from phonenumbers import geocoder as pn_geocoder
 from pydantic import BaseModel, Field
 
-VERSION = "0.18.0"
+VERSION = "0.18.1"
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 API_TOKEN = os.environ.get("OSINT_API_TOKEN", "").strip()
 DATA_ENCRYPTION_KEY = os.environ.get("DATA_ENCRYPTION_KEY", "").strip()
@@ -139,9 +138,11 @@ async def reaper():
                 with conn.cursor() as cur:
                     cur.execute("""
                         UPDATE jobs_v0151 SET status='interrupted',
-                        error='Job interrupted — heartbeat stale.', completed_at=NOW(), updated_at=NOW()
-                        WHERE status='running' AND (last_heartbeat_at IS NULL
-                            OR last_heartbeat_at < NOW() - INTERVAL '10 minutes')
+                        error='Job interrupted — heartbeat stale.',
+                        completed_at=NOW(), updated_at=NOW()
+                        WHERE status='running'
+                        AND (last_heartbeat_at IS NULL
+                             OR last_heartbeat_at < NOW() - INTERVAL '10 minutes')
                     """)
         except asyncio.CancelledError:
             return
@@ -157,14 +158,20 @@ async def on_start():
                 [sys.executable, "-m", "sherlock_project", "--version"]]:
         try:
             p = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
             await asyncio.wait_for(p.wait(), timeout=10)
             _sherlock = True
+            log.info("Sherlock: available via %s", " ".join(cmd[:2]))
             break
         except Exception:
             continue
+    if not _sherlock:
+        log.warning("Sherlock: not available — username auto-pivot disabled")
     asyncio.create_task(reaper())
-    log.info("OSINT Infosys %s initialized; sherlock=%s", VERSION, _sherlock)
+    log.info("OSINT Infosys %s initialized", VERSION)
 
 
 @app.head("/")
@@ -218,9 +225,9 @@ def parse_phone(raw: str):
         "carrier": pn_carrier.name_for_number(n, "en") or "Unknown",
         "location": pn_geocoder.description_for_number(n, "en") or "Unknown",
         "line_type": {0: "mobile", 1: "fixed_line", 2: "fixed_or_mobile", 3: "toll_free",
-                       4: "premium", 5: "shared", 6: "voip", 7: "personal", 8: "pager",
-                       9: "uan", 10: "voicemail", -1: "unknown"}.get(
-                       phonenumbers.number_type(n), "unknown"),
+                      4: "premium", 5: "shared", 6: "voip", 7: "personal", 8: "pager",
+                      9: "uan", 10: "voicemail", -1: "unknown"}.get(
+                      phonenumbers.number_type(n), "unknown"),
     }
 
 
@@ -259,9 +266,9 @@ def safe_url(u: str):
         return False
 
 
-# ---------- DNS ----------
 async def dns_check(domain):
-    r = dns.asyncresolver.Resolver(); r.lifetime = 5.0
+    r = dns.asyncresolver.Resolver()
+    r.lifetime = 5.0
     out = {}
     for label, qtype, qname in [
         ("MX", "MX", domain), ("A", "A", domain), ("AAAA", "AAAA", domain),
@@ -293,7 +300,6 @@ async def dns_check(domain):
     return out
 
 
-# ---------- RDAP ----------
 async def rdap_check(domain):
     try:
         async with httpx.AsyncClient(timeout=12, follow_redirects=True,
@@ -324,7 +330,6 @@ async def rdap_check(domain):
         return srec("RDAP", "error", "registration", error=type(e).__name__)
 
 
-# ---------- crt.sh ----------
 async def crtsh_check(domain):
     try:
         async with httpx.AsyncClient(timeout=25,
@@ -350,7 +355,6 @@ async def crtsh_check(domain):
         return srec("crt.sh", "error", "CT", error=type(e).__name__)
 
 
-# ---------- search ----------
 def unwrap_ddg(h):
     try:
         p = urlparse(h)
@@ -378,7 +382,8 @@ async def search(provider, q, limit=12):
             return srec(provider, "blocked", "search", results=[], http_status=r.status_code)
         if r.status_code != 200:
             return srec(provider, "unavailable", "search", results=[], http_status=r.status_code)
-        pg = r.text; low = pg.lower()
+        pg = r.text
+        low = pg.lower()
         if any(m in low for m in ("captcha", "unusual traffic", "verify you are human",
                                    "consent required", "robot check")):
             return srec(provider, "blocked", "challenge", results=[])
@@ -410,18 +415,22 @@ async def search(provider, q, limit=12):
         return srec(provider, "error", "search", results=[], error=type(e).__name__)
 
 
-# ---------- Holehe ----------
 async def holehe(email):
     for cmd in [["holehe", email, "--no-color"],
                 [sys.executable, "-m", "holehe", email, "--no-color"]]:
         try:
             p = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
             try:
                 so, se = await asyncio.wait_for(p.communicate(), timeout=150)
             except asyncio.TimeoutError:
-                p.kill(); await p.wait()
-                return srec("Holehe", "error", "CLI", found=[], not_found=[], rate_limited=[], error="timeout")
+                p.kill()
+                await p.wait()
+                return srec("Holehe", "error", "CLI", found=[], not_found=[],
+                            rate_limited=[], error="timeout")
             out = so.decode("utf-8", "replace")
             f, nf, rl, bl = [], [], [], []
             rec = 0
@@ -431,32 +440,39 @@ async def holehe(email):
                     continue
                 if ln.startswith("[+]"):
                     s = ln[3:].strip()
-                    if s: f.append(s); rec += 1
+                    if s:
+                        f.append(s)
+                        rec += 1
                 elif ln.startswith("[-]"):
                     s = ln[3:].strip()
-                    if s: nf.append(s); rec += 1
+                    if s:
+                        nf.append(s)
+                        rec += 1
                 elif ln.startswith("[x]"):
                     s = ln[3:].strip()
-                    if s: rl.append(s); rec += 1
+                    if s:
+                        rl.append(s)
+                        rec += 1
                 elif "blocked" in ln.lower():
                     bl.append(ln[:180])
             if rec == 0:
                 return srec("Holehe", "error", "CLI", found=[], not_found=[],
                             rate_limited=[], parser="unrecognized", error="No lines")
             st = "found" if f else ("rate_limited" if rl else ("blocked" if bl else ("not_found" if nf else "unavailable")))
-            return srec("Holehe", st, "CLI", found=list(dict.fromkeys(f)),
+            return srec("Holehe", st, "CLI",
+                        found=list(dict.fromkeys(f)),
                         not_found=list(dict.fromkeys(nf)),
-                        rate_limited=list(dict.fromkeys(rl)), blocked=bl,
-                        parser="recognized",
+                        rate_limited=list(dict.fromkeys(rl)),
+                        blocked=bl, parser="recognized",
                         limitation="Association signals only.")
         except FileNotFoundError:
             continue
         except Exception as e:
             log.warning("Holehe: %s", e)
-    return srec("Holehe", "unavailable", "CLI", found=[], not_found=[], rate_limited=[], error="not installed")
+    return srec("Holehe", "unavailable", "CLI", found=[], not_found=[],
+                rate_limited=[], error="not installed")
 
 
-# ---------- Sherlock ----------
 def strip_ansi(s):
     return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", s)
 
@@ -487,11 +503,15 @@ async def sherlock(username, timeout=240.0):
         [sys.executable, "-m", "sherlock_project", username, "--print-found", "--no-color", "--timeout", "8"]]:
         try:
             p = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
             try:
                 so, se = await asyncio.wait_for(p.communicate(), timeout=timeout)
             except asyncio.TimeoutError:
-                p.kill(); await p.wait()
+                p.kill()
+                await p.wait()
                 return {"username": username, "status": "timeout", "found": [], "error": "timeout"}
             out = strip_ansi(so.decode("utf-8", "replace"))
             err = se.decode("utf-8", "replace")
@@ -504,10 +524,12 @@ async def sherlock(username, timeout=240.0):
                 if m and safe_url(m.group(2)):
                     f.append({"platform": m.group(1).strip().rstrip(":").strip(),
                               "url": m.group(2).strip()})
-            seen = set(); uq = []
+            seen = set()
+            uq = []
             for x in f:
                 if x["url"] not in seen:
-                    seen.add(x["url"]); uq.append(x)
+                    seen.add(x["url"])
+                    uq.append(x)
             if not uq:
                 if any(k in err.lower() for k in ("captcha", "forbidden", "blocked", "429")):
                     return {"username": username, "status": "blocked", "found": [], "error": "blocked"}
@@ -520,30 +542,33 @@ async def sherlock(username, timeout=240.0):
     return {"username": username, "status": "unavailable", "found": [], "error": "not installed"}
 
 
-async def verify_sherlock(found, limit=15):
+async def verify_sherlock(found, limit=10):
     if not found:
         return []
     sem = asyncio.Semaphore(5)
     top = found[:limit]
     rest = found[limit:]
+
     async def one(item):
         async with sem:
             ok, note = await verify_url(item["url"])
             st = "found" if ok is True else ("not_verified" if ok is False else "unverified")
             return {**item, "verified": ok, "verification_note": note, "final_status": st}
+
     results = await asyncio.gather(*[one(i) for i in top], return_exceptions=True)
     out = []
     for item, r in zip(top, results):
         if isinstance(r, Exception):
-            out.append({**item, "verified": None, "verification_note": "error", "final_status": "unverified"})
+            out.append({**item, "verified": None,
+                        "verification_note": "error", "final_status": "unverified"})
         else:
             out.append(r)
     for item in rest:
-        out.append({**item, "verified": None, "verification_note": "limit reached", "final_status": "unverified"})
+        out.append({**item, "verified": None,
+                    "verification_note": "limit reached", "final_status": "unverified"})
     return out
 
 
-# ---------- NEW: Gravatar Profile JSON ----------
 async def gravatar_profile(email):
     md5 = hashlib.md5(email.strip().lower().encode()).hexdigest()
     try:
@@ -577,7 +602,6 @@ async def gravatar_profile(email):
         return srec("Gravatar Profile", "error", "profile JSON", error=type(e).__name__)
 
 
-# ---------- NEW: Keybase ----------
 async def keybase_lookup(email):
     try:
         async with httpx.AsyncClient(timeout=10,
@@ -609,7 +633,6 @@ async def keybase_lookup(email):
         return srec("Keybase", "error", "user lookup", error=type(e).__name__)
 
 
-# ---------- NEW: HackerNews ----------
 async def hackernews_search(email):
     try:
         async with httpx.AsyncClient(timeout=12,
@@ -637,27 +660,23 @@ async def hackernews_search(email):
         return srec("HackerNews", "error", "Algolia", error=type(e).__name__)
 
 
-# ---------- NEW: PGP Key Servers ----------
 async def pgp_check(email):
-    servers = ["https://keys.openpgp.org/vks/v1/by-email/",
-               "https://keyserver.ubuntu.com/pks/lookup?search=&op=get&options=mr&search="]
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True,
-                                 headers={"User-Agent": "OSINT-Infosys/0.18"}) as c:
-        try:
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True,
+                                     headers={"User-Agent": "OSINT-Infosys/0.18"}) as c:
             r = await c.get(f"https://keys.openpgp.org/vks/v1/by-email/{quote(email)}")
-            if r.status_code == 200 and "BEGIN PGP" in r.text:
-                return srec("PGP Keyserver", "found", "keys.openpgp.org",
-                            key_type="OpenPGP",
-                            key_id=r.headers.get("x-keyid") or "present",
-                            limitation="Public PGP key exists for this email.")
-            if r.status_code == 404:
-                return srec("PGP Keyserver", "not_found", "keys.openpgp.org")
-            return srec("PGP Keyserver", "unavailable", "keys.openpgp.org", http_status=r.status_code)
-        except Exception as e:
-            return srec("PGP Keyserver", "error", "keys.openpgp.org", error=type(e).__name__)
+        if r.status_code == 200 and "BEGIN PGP" in r.text:
+            return srec("PGP Keyserver", "found", "keys.openpgp.org",
+                        key_type="OpenPGP",
+                        key_id=r.headers.get("x-keyid") or "present",
+                        limitation="Public PGP key exists for this email.")
+        if r.status_code == 404:
+            return srec("PGP Keyserver", "not_found", "keys.openpgp.org")
+        return srec("PGP Keyserver", "unavailable", "keys.openpgp.org", http_status=r.status_code)
+    except Exception as e:
+        return srec("PGP Keyserver", "error", "keys.openpgp.org", error=type(e).__name__)
 
 
-# ---------- phone ----------
 async def phone_check(phone):
     info = parse_phone(phone)
     e164 = info["e164"]
@@ -675,12 +694,15 @@ async def phone_check(phone):
             "assessment": {"conclusion": "unresolved",
                            "note": "Numbering metadata inferred from E.164. Carrier may be inaccurate (MNP, VoIP)."}}
 
-# ---------- domain ----------
+
 async def domain_check(domain):
     dns_r, rdap_r, ct_r = await asyncio.gather(
-        dns_check(domain), rdap_check(domain), crtsh_check(domain), return_exceptions=True)
+        dns_check(domain), rdap_check(domain), crtsh_check(domain),
+        return_exceptions=True)
+
     def u(r, d):
         return d if isinstance(r, Exception) else r
+
     return {"domain": domain,
             "dns": u(dns_r, {}),
             "rdap": u(rdap_r, srec("RDAP", "error", "lookup", error="exc")),
@@ -689,14 +711,14 @@ async def domain_check(domain):
                            "note": "DNS, RDAP, CT are public records. Do not establish ownership."}}
 
 
-# ---------- heartbeat ----------
 async def heartbeat(job_id, stop):
     while not stop.is_set():
         try:
             with db() as conn:
                 with conn.cursor() as cur:
-                    cur.execute("UPDATE jobs_v0151 SET last_heartbeat_at=NOW(), updated_at=NOW() "
-                                "WHERE job_id=%s AND status='running'", (job_id,))
+                    cur.execute("UPDATE jobs_v0151 SET last_heartbeat_at=NOW(), "
+                                "updated_at=NOW() WHERE job_id=%s AND status='running'",
+                                (job_id,))
         except Exception:
             pass
         try:
@@ -705,7 +727,6 @@ async def heartbeat(job_id, stop):
             pass
 
 
-# ---------- execution ----------
 async def run_job(job_id, kind, payload):
     async with SEM:
         stop = asyncio.Event()
@@ -714,7 +735,8 @@ async def run_job(job_id, kind, payload):
             with db() as conn:
                 with conn.cursor() as cur:
                     cur.execute("UPDATE jobs_v0151 SET status='running', started_at=NOW(), "
-                                "last_heartbeat_at=NOW(), updated_at=NOW() WHERE job_id=%s", (job_id,))
+                                "last_heartbeat_at=NOW(), updated_at=NOW() WHERE job_id=%s",
+                                (job_id,))
             result = None
             if kind == "email":
                 result = await _email(payload)
@@ -741,9 +763,12 @@ async def run_job(job_id, kind, payload):
             except Exception:
                 pass
         finally:
-            stop.set(); hb.cancel()
-            try: await hb
-            except Exception: pass
+            stop.set()
+            hb.cancel()
+            try:
+                await hb
+            except Exception:
+                pass
 
 
 async def _email(email):
@@ -751,7 +776,6 @@ async def _email(email):
     derived = derive_usernames(email, 6)
     sherlock_targets = derived[:1] if _sherlock else []
 
-    # Parallel engines
     tasks = {
         "holehe": holehe(email),
         "dns": dns_check(domain),
@@ -764,7 +788,8 @@ async def _email(email):
     }
     sherlock_tasks = {f"sherlock:{u}": sherlock(u, 240) for u in sherlock_targets}
 
-    combined = await asyncio.gather(*tasks.values(), *sherlock_tasks.values(), return_exceptions=True)
+    combined = await asyncio.gather(
+        *tasks.values(), *sherlock_tasks.values(), return_exceptions=True)
     results = dict(zip(list(tasks.keys()) + list(sherlock_tasks.keys()), combined))
 
     def u(k, default):
@@ -773,23 +798,24 @@ async def _email(email):
 
     sherlock_results = []
     for target in sherlock_targets:
-        r = results.get(f"sherlock:{target}", {"username": target, "status": "error",
-                                                "found": [], "error": "exc"})
+        r = results.get(f"sherlock:{target}",
+                        {"username": target, "status": "error",
+                         "found": [], "error": "exc"})
         if isinstance(r, Exception):
             sherlock_results.append({"username": target, "status": "error",
                                      "found": [], "error": "exc"})
         else:
-                    verified = await verify_sherlock(r.get("found", []), limit=10)
+            verified = await verify_sherlock(r.get("found", []), limit=10)
             sherlock_results.append({**r, "found": verified})
 
-    # Dedupe public refs
     ddg = u("duckduckgo", srec("DuckDuckGo", "error", "search", results=[]))
     bing = u("bing", srec("Bing", "error", "search", results=[]))
     refs = []
     seen = set()
     for pr in (ddg, bing):
         for item in pr.get("results", []):
-            if item["url"] in seen: continue
+            if item["url"] in seen:
+                continue
             seen.add(item["url"])
             refs.append({**item, "discovery_source": pr["source"]})
 
@@ -802,10 +828,12 @@ async def _email(email):
         "sherlock": sherlock_results,
         "sources": {
             "dns": u("dns", {}),
-            "holehe": u("holehe", srec("Holehe", "error", "CLI", found=[], not_found=[], rate_limited=[])),
+            "holehe": u("holehe", srec("Holehe", "error", "CLI",
+                                        found=[], not_found=[], rate_limited=[])),
             "duckduckgo": ddg,
             "bing": bing,
-            "gravatar_profile": u("gravatar", srec("Gravatar Profile", "error", "profile")),
+            "gravatar_profile": u("gravatar",
+                                   srec("Gravatar Profile", "error", "profile")),
             "keybase": u("keybase", srec("Keybase", "error", "lookup")),
             "hackernews": u("hackernews", srec("HackerNews", "error", "Algolia")),
             "pgp": u("pgp", srec("PGP Keyserver", "error", "lookup")),
@@ -839,7 +867,6 @@ async def _domain(d):
             **(await domain_check(d))}
 
 
-# ---------- API ----------
 class EReq(BaseModel):
     email: str = Field(min_length=3, max_length=320)
 
@@ -862,7 +889,8 @@ def new_job(kind, payload):
     dig = keyed_hash(payload)
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO jobs_v0151 (job_id,job_type,status,email_ciphertext,email_sha256) "
+            cur.execute("INSERT INTO jobs_v0151 "
+                        "(job_id,job_type,status,email_ciphertext,email_sha256) "
                         "VALUES (%s,%s,'pending',%s,%s)", (jid, kind, enc, dig))
     return jid
 
@@ -909,8 +937,8 @@ async def get_job(job_id: str):
         raise HTTPException(400, "Invalid job ID")
     with db() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT job_id,job_type,status,result_ciphertext,error,created_at,"
-                        "updated_at,started_at,completed_at,last_heartbeat_at "
+            cur.execute("SELECT job_id,job_type,status,result_ciphertext,error,"
+                        "created_at,updated_at,started_at,completed_at,last_heartbeat_at "
                         "FROM jobs_v0151 WHERE job_id=%s", (job_id,))
             row = cur.fetchone()
     if not row:
@@ -926,17 +954,19 @@ async def get_job(job_id: str):
     return p
 
 
-# ---------- frontend ----------
 HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>OSINT Infosys v0.18</title>
+<title>OSINT Infosys v0.18.1</title>
 <style>
-*{box-sizing:border-box}body{margin:0;padding:16px;background:#090d12;color:#e5e7eb;font:15px -apple-system,BlinkMacSystemFont,system-ui,sans-serif}
-main{max-width:850px;margin:auto}header{text-align:center;padding:20px 0}
-h1{color:#34d399;margin:0;font-size:24px}.sub{color:#9ca3af;font-size:12px;margin:4px 0}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:#090d12;color:#e5e7eb;font:15px -apple-system,BlinkMacSystemFont,system-ui,sans-serif}
+main{max-width:850px;margin:auto}
+header{text-align:center;padding:20px 0}
+h1{color:#34d399;margin:0;font-size:24px}
+.sub{color:#9ca3af;font-size:12px;margin:4px 0}
 .panel{background:#111923;border:1px solid #263342;border-radius:12px;padding:16px;margin:12px 0}
 input{width:100%;padding:12px;background:#080d13;border:1px solid #374151;border-radius:8px;color:#fff;margin:6px 0;font-size:15px}
 button{width:100%;padding:14px;border:0;border-radius:8px;background:#34d399;color:#000;font-weight:700;margin-top:8px;cursor:pointer;font-size:15px}
@@ -945,60 +975,82 @@ button.link{background:transparent;color:#9ca3af;font-weight:400;font-size:12px;
 .tabs{display:flex;gap:4px;margin:12px 0;flex-wrap:wrap}
 .tabs button{flex:1;background:#172230;color:#9ca3af;border:1px solid #263342;padding:10px 4px;font-weight:600;font-size:12px;min-width:70px}
 .tabs button.active{background:#34d399;color:#000;border-color:#34d399}
-label{font-size:13px;color:#d1d5db}.warn{color:#fbbf24;font-size:11px}.muted{color:#9ca3af;font-size:12px}
+label{font-size:13px;color:#d1d5db}
+.warn{color:#fbbf24;font-size:11px}
+.muted{color:#9ca3af;font-size:12px}
 .status{padding:12px;border-radius:8px;background:#172b42;margin:12px 0;font-size:13px}
 .error{background:#3b1d1d;color:#fca5a5}
 .item{border-bottom:1px solid #263342;padding:10px 0;word-wrap:break-word;overflow-wrap:anywhere}
 .item:last-child{border:0}
 .pill{font-size:10px;padding:2px 7px;border-radius:10px;background:#1f2937;color:#d1d5db;margin-left:6px}
-.pill.found{background:#065f46;color:#6ee7b7}.pill.rate{background:#78350f;color:#fbbf24}
-.pill.error{background:#7f1d1d;color:#fca5a5}.pill.verified{background:#065f46;color:#6ee7b7}
-.pill.unverified{background:#78350f;color:#fbbf24}.pill.highlight{background:#1e40af;color:#93c5fd}
-a{color:#6ee7b7;word-break:break-all}.bad{color:#fca5a5}
-details{margin-top:8px}summary{cursor:pointer;color:#fbbf24;font-weight:600;font-size:13px}
+.pill.found{background:#065f46;color:#6ee7b7}
+.pill.rate{background:#78350f;color:#fbbf24}
+.pill.error{background:#7f1d1d;color:#fca5a5}
+.pill.verified{background:#065f46;color:#6ee7b7}
+.pill.unverified{background:#78350f;color:#fbbf24}
+.pill.highlight{background:#1e40af;color:#93c5fd}
+a{color:#6ee7b7;word-break:break-all}
+.bad{color:#fca5a5}
+details{margin-top:8px}
+summary{cursor:pointer;color:#fbbf24;font-weight:600;font-size:13px}
 .suggestion{display:inline-block;margin:4px 4px 0 0;padding:6px 12px;background:#1f2937;color:#6ee7b7;border:1px solid #374151;border-radius:6px;font-size:13px;cursor:pointer;width:auto;font-weight:500}
 .profile{padding:8px 0;border-bottom:1px solid #263342}
-.profile:last-child{border:0}.profile-name{font-weight:600;font-size:13px;color:#f3f4f6}
+.profile:last-child{border:0}
+.profile-name{font-weight:600;font-size:13px;color:#f3f4f6}
 .profile-url{font-size:11px;color:#6ee7b7;word-break:break-all}
 </style>
 </head>
 <body>
 <main>
-<header><h1>OSINT Infosys</h1>
-<p class="sub">Email · Username · Phone · Domain · v0.18.0 (multi-source)</p>
-<p class="warn">Authorized investigations only · findings are leads, not identity proof</p></header>
+<header>
+  <h1>OSINT Infosys</h1>
+  <p class="sub">Email · Username · Phone · Domain · v0.18.1</p>
+  <p class="warn">Authorized investigations only · findings are leads, not identity proof</p>
+</header>
 
 <section class="panel" id="auth" style="display:none">
-<label>API token</label>
-<input id="tok" type="password" autocomplete="off">
-<button onclick="saveTok()">Save &amp; Continue</button></section>
+  <label>API token</label>
+  <input id="tok" type="password" autocomplete="off">
+  <button onclick="saveTok()">Save &amp; Continue</button>
+</section>
 
 <section class="panel" id="search" style="display:none">
-<div class="tabs">
-<button id="t-email" class="active" onclick="tab('email')">Email</button>
-<button id="t-username" onclick="tab('username')">Username</button>
-<button id="t-phone" onclick="tab('phone')">Phone</button>
-<button id="t-domain" onclick="tab('domain')">Domain</button>
-</div>
-<div id="p-email"><label>Email</label>
-<input id="in-email" type="email" autocomplete="off" placeholder="name@example.com">
-<button id="r-email" onclick="runEmail()">Investigate Email</button>
-<p class="muted">DNS + Holehe + Bing + DDG + Gravatar Profile + Keybase + HackerNews + PGP + Sherlock (3 usernames). ~4–6 min.</p></div>
-<div id="p-username" style="display:none"><label>Username</label>
-<input id="in-username" type="text" autocomplete="off" placeholder="handle">
-<button id="r-username" onclick="runUsername()">Investigate Username</button></div>
-<div id="p-phone" style="display:none"><label>Phone (E.164 preferred)</label>
-<input id="in-phone" type="tel" autocomplete="off" placeholder="+8801712345678">
-<button id="r-phone" onclick="runPhone()">Investigate Phone</button></div>
-<div id="p-domain" style="display:none"><label>Domain</label>
-<input id="in-domain" type="text" autocomplete="off" placeholder="example.com">
-<button id="r-domain" onclick="runDomain()">Investigate Domain</button></div>
-<button class="link" onclick="forget()">Forget token</button></section>
+  <div class="tabs">
+    <button id="t-email" class="active" onclick="tab('email')">Email</button>
+    <button id="t-username" onclick="tab('username')">Username</button>
+    <button id="t-phone" onclick="tab('phone')">Phone</button>
+    <button id="t-domain" onclick="tab('domain')">Domain</button>
+  </div>
+  <div id="p-email">
+    <label>Email</label>
+    <input id="in-email" type="email" autocomplete="off" placeholder="name@example.com">
+    <button id="r-email" onclick="runEmail()">Investigate Email</button>
+    <p class="muted">DNS + Holehe + Bing + DDG + Gravatar + Keybase + HN + PGP + Sherlock (1 username). ~2–4 min.</p>
+  </div>
+  <div id="p-username" style="display:none">
+    <label>Username</label>
+    <input id="in-username" type="text" autocomplete="off" placeholder="handle">
+    <button id="r-username" onclick="runUsername()">Investigate Username</button>
+  </div>
+  <div id="p-phone" style="display:none">
+    <label>Phone (E.164 preferred)</label>
+    <input id="in-phone" type="tel" autocomplete="off" placeholder="+8801712345678">
+    <button id="r-phone" onclick="runPhone()">Investigate Phone</button>
+  </div>
+  <div id="p-domain" style="display:none">
+    <label>Domain</label>
+    <input id="in-domain" type="text" autocomplete="off" placeholder="example.com">
+    <button id="r-domain" onclick="runDomain()">Investigate Domain</button>
+  </div>
+  <button class="link" onclick="forget()">Forget token</button>
+</section>
 
-<div id="stat"></div><div id="out"></div>
+<div id="stat"></div>
+<div id="out"></div>
 </main>
 <script>
-const K="osint_api_token_v0151";let P=null;
+const K="osint_api_token_v0151";
+let P=null;
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function tk(){return localStorage.getItem(K)||''}
 function H(){return {'Authorization':'Bearer '+tk(),'Content-Type':'application/json'}}
@@ -1007,27 +1059,28 @@ function forget(){localStorage.removeItem(K);document.getElementById('auth').sty
 function show(){document.getElementById('auth').style.display='none';document.getElementById('search').style.display='block'}
 function tab(t){['email','username','phone','domain'].forEach(x=>{document.getElementById('t-'+x).classList.toggle('active',x===t);document.getElementById('p-'+x).style.display=x===t?'block':'none'});document.getElementById('out').innerHTML='';document.getElementById('stat').innerHTML=''}
 function resetBtns(){const m={email:'Investigate Email',username:'Investigate Username',phone:'Investigate Phone',domain:'Investigate Domain'};for(const[k,v] of Object.entries(m)){const b=document.getElementById('r-'+k);if(b){b.disabled=false;b.textContent=v}}}
-function poll(id,type){let n=0;clearInterval(P);P=setInterval(async()=>{n++;if(n>200){clearInterval(P);resetBtns();err('Polling limit');return}try{const r=await fetch('/api/job/'+encodeURIComponent(id),{headers:H()});const ct=r.headers.get('content-type')||'';if(!ct.includes('application/json')){if(n<100){document.getElementById('stat').innerHTML='<div class="status">Server restarting ('+r.status+'). Retrying… ('+(n*3)+'s)</div>';return}throw Error('HTTP '+r.status+' non-JSON (jobId: '+id+')')}const j=await r.json();if(!r.ok)throw Error(j.detail||r.status);if(['done','failed','interrupted'].includes(j.status)){clearInterval(P);resetBtns();if(j.status==='done'){if(type==='email')showEmail(j.result);else if(type==='username')showUser(j.result);else if(type==='phone')showPhone(j.result);else showDomain(j.result)}else err('Job '+j.status+': '+(j.error||''))}else document.getElementById('stat').innerHTML='<div class="status">'+esc(j.status)+'… ('+(n*3)+'s)</div>'}catch(e){clearInterval(P);resetBtns();err(e.message)}},3000)}
+async function readJson(r){const ct=r.headers.get('content-type')||'';if(!ct.includes('application/json')){throw Error('Server HTTP '+r.status+' non-JSON (retry in 60s)')}return await r.json()}
+function poll(id,type){let n=0;clearInterval(P);P=setInterval(async()=>{n++;if(n>200){clearInterval(P);resetBtns();err('Polling limit — check later');return}try{const r=await fetch('/api/job/'+encodeURIComponent(id),{headers:H()});if(!r.ok&&r.status>=500){document.getElementById('stat').innerHTML='<div class="status">Server restarting ('+r.status+'). Retrying…</div>';return}const j=await readJson(r);if(j.status==='done'){clearInterval(P);resetBtns();if(type==='email')showEmail(j.result);else if(type==='username')showUser(j.result);else if(type==='phone')showPhone(j.result);else showDomain(j.result)}else if(j.status==='failed'||j.status==='interrupted'){clearInterval(P);resetBtns();err('Job '+j.status+': '+(j.error||''))}else document.getElementById('stat').innerHTML='<div class="status">'+esc(j.status)+'… ('+(n*3)+'s)</div>'}catch(e){clearInterval(P);resetBtns();err(e.message)}},3000)}
 function err(m){document.getElementById('stat').innerHTML='<div class="status error">'+esc(m)+'</div>'}
-async function go(url,body,type,btn){const b=document.getElementById(btn);b.disabled=true;b.textContent='Investigating…';document.getElementById('out').innerHTML='';document.getElementById('stat').innerHTML='<div class="status">Starting '+type+' investigation…</div>';try{const r=await fetch(url,{method:'POST',headers:H(),body:JSON.stringify(body)});const ct=r.headers.get('content-type')||'';if(!ct.includes('application/json')){throw Error('Server returned non-JSON (HTTP '+r.status+'). Wait 60s and retry.')}const d=await r.json();if(!r.ok)throw Error(d.detail||r.status);poll(d.jobId,type)}catch(e){resetBtns();err(e.message)}}
+async function go(url,body,type,btn){const b=document.getElementById(btn);b.disabled=true;b.textContent='Investigating…';document.getElementById('out').innerHTML='';document.getElementById('stat').innerHTML='<div class="status">Starting '+type+' investigation…</div>';try{const r=await fetch(url,{method:'POST',headers:H(),body:JSON.stringify(body)});const d=await readJson(r);poll(d.jobId,type)}catch(e){resetBtns();err(e.message)}}
 function runEmail(){const v=document.getElementById('in-email').value.trim();if(!v)return;go('/api/check',{email:v},'email','r-email')}
 function runUsername(){const v=document.getElementById('in-username').value.trim();if(!v)return;go('/api/check-username',{username:v},'username','r-username')}
 function runPhone(){const v=document.getElementById('in-phone').value.trim();if(!v)return;go('/api/check-phone',{phone:v},'phone','r-phone')}
 function runDomain(){const v=document.getElementById('in-domain').value.trim();if(!v)return;go('/api/check-domain',{domain:v},'domain','r-domain')}
 function sUrl(u){try{const p=new URL(u);return ['http:','https:'].includes(p.protocol)}catch{return false}}
 function sec(name,v){const st=v?.status||'?';const pc=st==='found'?'verified':st==='rate_limited'?'rate':st==='error'?'error':'';let b='';if(v?.found?.length)b+='<p>Found: '+esc(v.found.join(', '))+'</p>';if(v?.rate_limited?.length){const t=(v.found?.length||0)+(v.not_found?.length||0)+(v.rate_limited?.length||0);const pct=t?Math.round(100*v.rate_limited.length/t):0;b+='<details><summary>'+v.rate_limited.length+' rate-limited ('+pct+'%)</summary><p>'+esc(v.rate_limited.join(', '))+'</p></details>'}if(v?.not_found?.length)b+='<p class="muted">Not found: '+esc(v.not_found.join(', '))+'</p>';if(v?.values?.length)b+='<p>'+esc(v.values.join(', '))+'</p>';if(v?.results?.length)b+='<p>'+v.results.length+' reference(s)</p>';if(v?.hosts?.length)b+='<details><summary>'+v.hosts.length+' hostnames</summary><p>'+esc(v.hosts.slice(0,40).join(', '))+'</p></details>';if(v?.error)b+='<p class="bad">Error: '+esc(v.error)+'</p>';if(v?.limitation)b+='<p class="muted">'+esc(v.limitation)+'</p>';return '<section class="panel"><h3>'+esc(name)+' <span class="pill '+pc+'">'+esc(st)+'</span></h3>'+b+'</section>'}
-function sher(found,user){if(!found?.length)return '<p class="muted">No profiles found for @'+esc(user)+'</p>';let h='';for(const p of found){const fs=p.final_status||'found';const pc=fs==='found'?'verified':fs==='not_verified'?'unverified':'';h+='<div class="profile"><div class="profile-name">'+esc(p.platform)+' <span class="pill '+pc+'">'+esc(fs)+'</span></div>';if(p.verification_note)h+='<div class="muted" style="font-size:10px">'+esc(p.verification_note)+'</div>';if(sUrl(p.url))h+='<a class="profile-url" href="'+esc(p.url)+'" target="_blank" rel="noopener">'+esc(p.url)+'</a>';h+='</div>'}return h}
+function sher(found,user){if(!found?.length)return '<p class="muted">No profiles for @'+esc(user)+'</p>';let h='';for(const p of found){const fs=p.final_status||'found';const pc=fs==='found'?'verified':fs==='not_verified'?'unverified':'';h+='<div class="profile"><div class="profile-name">'+esc(p.platform)+' <span class="pill '+pc+'">'+esc(fs)+'</span></div>';if(p.verification_note)h+='<div class="muted" style="font-size:10px">'+esc(p.verification_note)+'</div>';if(sUrl(p.url))h+='<a class="profile-url" href="'+esc(p.url)+'" target="_blank" rel="noopener">'+esc(p.url)+'</a>';h+='</div>'}return h}
 function showEmail(r){document.getElementById('stat').innerHTML='<div class="status">Completed. Empty = not proof of absence.</div>';let h='';
 if(r.derived_usernames?.length){h+='<section class="panel"><h3>Derived usernames <span class="pill highlight">pivot</span></h3>';for(const u of r.derived_usernames)h+='<button class="suggestion" onclick="pivot(\''+esc(u)+'\')">'+esc(u)+'</button>';h+='</section>'}
-const gp=r.sources?.gravatar_profile;if(gp?.status==='found'){h+='<section class="panel"><h3>Gravatar Profile <span class="pill verified">found</span></h3>';if(gp.display_name)h+='<div class="item"><b>Name:</b> '+esc(gp.display_name)+'</div>';if(gp.about)h+='<div class="item"><b>About:</b> '+esc(gp.about)+'</div>';if(gp.location)h+='<div class="item"><b>Location:</b> '+esc(gp.location)+'</div>';if(gp.accounts?.length){h+='<div class="item"><b>Linked accounts ('+gp.accounts.length+'):</b><br>';for(const a of gp.accounts){h+='<span class="pill highlight">'+esc(a.domain||'?')+'</span> '+esc(a.username||'')+' ';if(a.url&&sUrl(a.url))h+='<a href="'+esc(a.url)+'" target="_blank" rel="noopener">'+esc(a.url)+'</a>';h+='<br>'}h+='</div>'}if(gp.urls?.length){h+='<div class="item"><b>URLs:</b><br>';for(const u of gp.urls)h+='• '+esc(u.title||'')+': '+(sUrl(u.value)?'<a href="'+esc(u.value)+'" target="_blank" rel="noopener">'+esc(u.value)+'</a>':esc(u.value))+'<br>';h+='</div>'}h+='</section>'}
-const kb=r.sources?.keybase;if(kb?.status==='found'){h+='<section class="panel"><h3>Keybase <span class="pill verified">found</span></h3><div class="item"><b>Username:</b> '+esc(kb.username)+'</div>';if(kb.full_name)h+='<div class="item"><b>Full name:</b> '+esc(kb.full_name)+'</div>';if(kb.location)h+='<div class="item"><b>Location:</b> '+esc(kb.location)+'</div>';if(kb.proofs?.length){h+='<div class="item"><b>Verified proofs ('+kb.proofs.length+'):</b><br>';for(const p of kb.proofs)h+='<span class="pill highlight">'+esc(p.platform||'?')+'</span> '+esc(p.username||'')+(p.url?' <a href="'+esc(p.url)+'" target="_blank" rel="noopener">'+esc(p.url)+'</a>':'')+'<br>';h+='</div>'}h+='</section>'}
-const hn=r.sources?.hackernews;if(hn?.status==='found'&&hn.results?.length){h+='<section class="panel"><h3>HackerNews mentions <span class="pill found">'+hn.total+'</span></h3>';for(const x of hn.results.slice(0,10)){h+='<div class="item"><b>'+esc(x.author||'?')+'</b> · '+esc(x.created_at||'')+'<br>';if(x.story_title)h+='<i>'+esc(x.story_title)+'</i><br>';h+='<span class="muted">'+esc(x.comment_excerpt||'')+'</span><br>';if(sUrl(x.url))h+='<a href="'+esc(x.url)+'" target="_blank" rel="noopener">'+esc(x.url)+'</a>';h+='</div>'}h+='</section>'}
+const gp=r.sources?.gravatar_profile;if(gp?.status==='found'){h+='<section class="panel"><h3>Gravatar Profile <span class="pill verified">found</span></h3>';if(gp.display_name)h+='<div class="item"><b>Name:</b> '+esc(gp.display_name)+'</div>';if(gp.about)h+='<div class="item"><b>About:</b> '+esc(gp.about)+'</div>';if(gp.location)h+='<div class="item"><b>Location:</b> '+esc(gp.location)+'</div>';if(gp.accounts?.length){h+='<div class="item"><b>Linked accounts:</b><br>';for(const a of gp.accounts)h+='<span class="pill highlight">'+esc(a.domain||'?')+'</span> '+esc(a.username||'')+'<br>'}h+='</section>'}
+const kb=r.sources?.keybase;if(kb?.status==='found'){h+='<section class="panel"><h3>Keybase <span class="pill verified">found</span></h3><div class="item"><b>Username:</b> '+esc(kb.username)+'</div>';if(kb.full_name)h+='<div class="item"><b>Full name:</b> '+esc(kb.full_name)+'</div>';if(kb.proofs?.length){h+='<div class="item"><b>Proofs:</b><br>';for(const p of kb.proofs)h+='<span class="pill highlight">'+esc(p.platform||'?')+'</span> '+esc(p.username||'')+'<br>'}h+='</section>'}
+const hn=r.sources?.hackernews;if(hn?.status==='found'&&hn.results?.length){h+='<section class="panel"><h3>HackerNews <span class="pill found">'+hn.total+'</span></h3>';for(const x of hn.results.slice(0,10)){h+='<div class="item"><b>'+esc(x.author||'?')+'</b> · '+esc(x.created_at||'')+'<br>';if(x.story_title)h+='<i>'+esc(x.story_title)+'</i><br>';h+='<span class="muted">'+esc(x.comment_excerpt||'')+'</span><br>';if(sUrl(x.url))h+='<a href="'+esc(x.url)+'" target="_blank" rel="noopener">'+esc(x.url)+'</a>';h+='</div>'}h+='</section>'}
 const pgp=r.sources?.pgp;if(pgp?.status==='found'){h+='<section class="panel"><h3>PGP Key <span class="pill verified">found</span></h3><div class="item">'+esc(pgp.key_type||'')+' '+esc(pgp.key_id||'')+'</div></section>'}
-const sh=r.sherlock||[];if(sh.length){h+='<section class="panel"><h3>Sherlock (auto-derived)</h3>';for(const s of sh){const found=s.found||[];const v=found.filter(x=>x.final_status==='found').length;h+='<details open><summary>@'+esc(s.username)+' · '+v+' verified / '+found.length+' candidates</summary>'+sher(found,s.username)+'</details>'}h+='</section>'}
+const sh=r.sherlock||[];if(sh.length){h+='<section class="panel"><h3>Sherlock</h3>';for(const s of sh){const found=s.found||[];const v=found.filter(x=>x.final_status==='found').length;h+='<details open><summary>@'+esc(s.username)+' · '+v+' verified / '+found.length+' candidates</summary>'+sher(found,s.username)+'</details>'}h+='</section>'}
 for(const [k,v] of Object.entries(r.sources||{})){if(['gravatar_profile','keybase','hackernews','pgp'].includes(k))continue;if(k==='dns'){for(const [dk,dv] of Object.entries(v||{}))h+=sec('DNS · '+dk,dv)}else h+=sec(k,v)}
 if(r.public_references?.length){h+='<section class="panel"><h3>Public references ('+r.public_references.length+')</h3>';for(const x of r.public_references){h+='<div class="item"><b>'+esc(x.title||'')+'</b> · '+esc(x.discovery_source||'')+'<br>';if(sUrl(x.url))h+='<a href="'+esc(x.url)+'" target="_blank" rel="noopener">'+esc(x.url)+'</a>';if(x.snippet)h+='<p class="muted">'+esc(x.snippet)+'</p>';h+='</div>'}h+='</section>'}
 document.getElementById('out').innerHTML=h}
-function showUser(r){document.getElementById('stat').innerHTML='<div class="status">Sherlock for @'+esc(r.username)+'</div>';const s=r.sherlock||{};const found=s.found||[];const v=found.filter(x=>x.final_status==='found').length;let h='<section class="panel"><h3>Sherlock <span class="pill verified">'+v+' verified</span> <span class="pill">'+found.length+' total</span></h3>'+sher(found,r.username)+'</section>';document.getElementById('out').innerHTML=h}
+function showUser(r){document.getElementById('stat').innerHTML='<div class="status">Sherlock @'+esc(r.username)+'</div>';const s=r.sherlock||{};const found=s.found||[];const v=found.filter(x=>x.final_status==='found').length;let h='<section class="panel"><h3>Sherlock <span class="pill verified">'+v+' verified</span> <span class="pill">'+found.length+' total</span></h3>'+sher(found,r.username)+'</section>';document.getElementById('out').innerHTML=h}
 function showPhone(r){document.getElementById('stat').innerHTML='<div class="status">Phone ready.</div>';const p=r.parsed||{};let h='<section class="panel"><h3>Parsed</h3><div class="item"><b>E.164:</b> '+esc(p.e164)+'</div><div class="item"><b>National:</b> '+esc(p.national)+'</div><div class="item"><b>Country:</b> '+esc(p.country)+'</div><div class="item"><b>Carrier:</b> '+esc(p.carrier)+'</div><div class="item"><b>Location:</b> '+esc(p.location)+'</div><div class="item"><b>Line type:</b> '+esc(p.line_type)+'</div><div class="item"><b>Valid:</b> '+String(!!p.valid)+'</div>';if(r.bd_prefix_carrier)h+='<div class="item"><b>BD:</b> '+esc(r.bd_prefix_carrier)+'</div>';h+='</section>';if(r.manual_queries?.length){h+='<section class="panel"><h3>Manual</h3>';for(const q of r.manual_queries)h+='<div class="item"><b>'+esc(q.tool)+'</b><br>'+(sUrl(q.url)?'<a href="'+esc(q.url)+'" target="_blank" rel="noopener">'+esc(q.url)+'</a>':'')+'</div>';h+='</section>'}document.getElementById('out').innerHTML=h}
 function showDomain(r){document.getElementById('stat').innerHTML='<div class="status">Domain ready.</div>';let h='';for(const [k,v] of Object.entries(r.dns||{}))h+=sec('DNS · '+k,v);const rdap=r.rdap||{};if(rdap.status==='found'){h+='<section class="panel"><h3>RDAP <span class="pill verified">found</span></h3><div class="item"><b>Registrar:</b> '+esc(rdap.registrar)+'</div>';for(const [e,d] of Object.entries(rdap.events||{}))h+='<div class="item"><b>'+esc(e)+':</b> '+esc(d)+'</div>';if(rdap.nameservers?.length)h+='<div class="item"><b>NS:</b> '+esc(rdap.nameservers.join(', '))+'</div>';h+='</section>'}else h+=sec('RDAP',rdap);h+=sec('crt.sh',r.crtsh||{});document.getElementById('out').innerHTML=h}
 function pivot(u){tab('username');document.getElementById('in-username').value=u;runUsername()}
